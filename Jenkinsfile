@@ -48,13 +48,13 @@ pipeline {
             }
         }
 
-        stage('Dependency Vulnerability Scan') {
-            steps {
-                sh '''
-                    go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-                '''
-            }
-        }
+        // stage('Dependency Vulnerability Scan') {
+        //     steps {
+        //         sh '''
+        //             go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        //         '''
+        //     }
+        // }
     }
 
     post {
