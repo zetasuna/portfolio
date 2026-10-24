@@ -1,0 +1,50 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: homelab
+
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - 127.0.0.1:9090
+
+  - job_name: portfolio-app
+    metrics_path: /metrics
+    scrape_timeout: 5s
+    static_configs:
+      - targets:
+          - app1:8080
+        labels: { app_instance: app1 }
+      - targets:
+          - app2:8080
+        labels: { app_instance: app2 }
+      - targets:
+          - app3:8080
+        labels: { app_instance: app3 }
+
+  - job_name: node-exporter
+    static_configs:
+      - targets:
+          - node-exporter:9100
+
+  - job_name: cadvisor
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - cadvisor:8080
+
+  - job_name: loki
+    static_configs:
+      - targets:
+          - loki:3100

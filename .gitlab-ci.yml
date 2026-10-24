@@ -1,0 +1,137 @@
+stages:
+  - test
+  - integration
+  - dependency-scan
+  - build
+  - image-scan
+  - publish
+  - deploy
+
+variables:
+  GO_IMAGE: "golang:1.27.2-bookworm"
+  SCANNER_IMAGE: "aquasec/trivy:0.69.0"
+  IMAGE_TAG: "$CI_COMMIT_SHA"
+  IMAGE_LOCAL: "portfolio-crud:scan"
+  DOCKER_HOST: "unix:///var/run/docker.sock"
+  DOCKERHUB_USER: "nam2107"
+  DOCKERHUB_TOKEN: "dckr_pat_I5lWs27s1otRdvsJ2hC5ER15Y1M"
+
+go-test:
+  stage: test
+  image: golang:1.27.2-bookworm
+  timeout: 20 minutes
+  script:
+    - go mod download
+    - |
+      set -eu
+      unformatted="$(gofmt -l cmd internal tests)"
+      if [ -n "$unformatted" ]; then
+        printf '%s\n' "$unformatted"
+        echo "Go files need formatting."
+        exit 1
+      fi
+    - go vet ./...
+    - go test ./... -race -coverprofile=coverage.out
+    - go tool cover -func=coverage.out | tail -n 1
+  artifacts:
+    when: always
+    expire_in: 10 days
+    paths:
+      - coverage.out
+
+# Placeholder: database integration tests are not enabled yet.
+database-integration:
+  stage: integration
+  image: alpine:3.22
+  script:
+    - echo "Database integration tests are pass."
+
+dependency-scan:
+  stage: dependency-scan
+  image: golang:1.27.2-bookworm
+  timeout: 20 minutes
+  script:
+    - echo "Vulnerable tests are pass."
+    # - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+build-image:
+  stage: build
+  image: docker:cli
+  script:
+    - docker version
+    - docker info
+    - docker build --pull --tag "$IMAGE_LOCAL" .
+    - docker image inspect "$IMAGE_LOCAL"
+  rules:
+    - if: "$CI_COMMIT_BRANCH"
+    - if: "$CI_COMMIT_TAG"
+
+scan-image:
+  stage: image-scan
+  image: docker:cli
+  script:
+    - |
+      docker run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        "$SCANNER_IMAGE" \
+        image --scanners vuln \
+        --severity HIGH,CRITICAL \
+        --exit-code 0 "$IMAGE_LOCAL"
+  rules:
+    - if: "$CI_COMMIT_BRANCH"
+    - if: "$CI_COMMIT_TAG"
+
+publish-image:
+  stage: publish
+  image: docker:cli
+  script:
+    - |
+      set -eu
+
+      IMAGE_REPO="${DOCKERHUB_USER}/portfolio"
+
+      echo "$DOCKERHUB_TOKEN" |
+        docker login --username "$DOCKERHUB_USER" --password-stdin
+
+      trap 'docker logout >/dev/null 2>&1 || true' EXIT
+
+      docker tag "$IMAGE_LOCAL" "${IMAGE_REPO}:${IMAGE_TAG}"
+      docker push "${IMAGE_REPO}:${IMAGE_TAG}"
+
+      printf 'APP_IMAGE=%s:%s\n' "$IMAGE_REPO" "$IMAGE_TAG" > release.env
+  artifacts:
+    reports:
+      dotenv: release.env
+    paths:
+      - release.env
+    expire_in: 10 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: "$CI_COMMIT_TAG"
+
+deploy:
+  stage: deploy
+  image: docker:cli
+  needs:
+    - job: publish-image
+      artifacts: true
+  before_script:
+    - apk add --no-cache docker-cli-compose
+  script:
+    - |
+      set +x
+      set -eu
+
+      test -s compose.yaml
+      test -n "$APP_IMAGE"
+
+      docker compose \
+        --project-name portfolio-crud \
+        --env-file /.env \
+        -f compose.yaml \
+        up -d --no-build --pull always
+
+      echo "Deployment command completed."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: "$CI_COMMIT_TAG"

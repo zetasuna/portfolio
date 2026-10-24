@@ -1,0 +1,31 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: ["alertname", "job", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  # This default receiver intentionally has no email/webhook integration yet.
+  # Add an email_configs or webhook_configs entry here to deliver notifications.
+  - name: default
+    telegram_configs:
+      - send_resolved: true
+        bot_token: 8993198108:AAFeMDX8YgFccDXjF45M6tg_BN2BaZOsAjk
+        chat_id: -1004445722502
+        message: |
+          {{ if .CommonAnnotations.summary }}<b>🚨 {{ .CommonAnnotations.summary }}</b>{{ else }}<b>✅ {{ .CommonAnnotations.summary }}</b>{{ end }}
+          {{ if eq .CommonLabels.severity "critical" }}🔴 CRITICAL{{ else if eq .CommonLabels.severity "warning" }}🟠 WARNING{{ else }}🔵 {{ .CommonLabels.severity }}{{ end }}
+          🔧 {{ .CommonLabels.job }}
+          🖥️ {{ .CommonLabels.instance }}
+          {{ if .CommonAnnotations.description }}{{ .CommonAnnotations.description }}{{ end }}
+
+inhibit_rules:
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    equal: ["alertname", "instance"]

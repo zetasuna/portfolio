@@ -1,0 +1,124 @@
+groups:
+  - name: portfolio-availability
+    rules:
+      - alert: PrometheusTargetDown
+        expr: |
+          up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus target is DOWN"
+          description: |
+            "🐳 Target {{ $labels.job }} ({{ $labels.instance }}) has been unreachable for more than 2 minutes."
+
+      - alert: PortfolioAppInstanceDown
+        expr: |
+          up{job="portfolio-app"} == 0
+        for: 2s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Portfolio app instance is DOWN"
+          description: |
+            "🌐 Portfolio instance {{ $labels.app_instance }} ({{ $labels.instance }}) is not being scraped."
+
+  - name: host-resource-alerts
+    rules:
+      - alert: HostHighCPU
+        expr: |
+          ( 
+            1 - avg by (instance) (rate(node_cpu_seconds_total{job="node-exporter",mode="idle"}[5m]))
+          ) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host CPU usage is high"
+          description: |
+            "🖥️ Host {{ $labels.instance }} CPU usage has been above 85% for 10 minutes."
+
+      - alert: HostHighMemory
+        expr: |
+          (
+            1 - node_memory_MemAvailable_bytes{job="node-exporter"} 
+            / 
+            node_memory_MemTotal_bytes{job="node-exporter"}
+          ) * 100 > 90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host memory usage is high"
+          description: |
+            "🖥️ Host {{ $labels.instance }} memory usage has been above 90% for 10 minutes."
+
+      - alert: HostFilesystemAlmostFull
+        expr: |
+          (
+            1 - node_filesystem_avail_bytes{job="node-exporter",fstype!~"tmpfs|overlay|squashfs|ramfs"} 
+            /
+            node_filesystem_size_bytes{job="node-exporter",fstype!~"tmpfs|overlay|squashfs|ramfs"}
+          ) *100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host filesystem is almost full"
+          description: |
+            "📁 Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} has been more than 85% full for 10 minutes."
+
+  - name: container-resource-alerts
+    rules:
+      - alert: ContainerHighMemory
+        expr: |
+          (
+            container_memory_working_set_bytes{job="cadvisor",image!=""}
+            /
+            (container_spec_memory_limit_bytes{job="cadvisor",image!=""} > 0)
+          ) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container memory usage is high"
+          description: |
+            "🐳 Container {{ $labels.name }} memory working set has exceeded 85% of its configured limit for 10 minutes."
+
+  - name: portfolio-web-availability
+    rules:
+      - alert: PortfolioApp1WebDown
+        expr: |
+          up{job="portfolio-app", app_instance="app1"} == 0
+        for: 1s
+        labels:
+          severity: critical
+          service: portfolio-web
+          instance_name: app1
+        annotations:
+          summary: "Web service app1 is DOWN"
+          description: "🌐 Check the app1 container and web service."
+
+      - alert: PortfolioApp2WebDown
+        expr: |
+          up{job="portfolio-app", app_instance="app2"} == 0
+        for: 1s
+        labels:
+          severity: critical
+          service: portfolio-web
+          instance_name: app2
+        annotations:
+          summary: "Web service app2 is DOWN"
+          description: "🌐 Check the app2 container and web service."
+
+      - alert: PortfolioApp3WebDown
+        expr: |
+          up{job="portfolio-app", app_instance="app3"} == 0
+        for: 1s
+        labels:
+          severity: critical
+          service: portfolio-web
+          instance_name: app3
+        annotations:
+          summary: "Web service app3 is DOWN"
+          description: "🌐 Check the app3 container and web service."
