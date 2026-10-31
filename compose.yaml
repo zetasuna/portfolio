@@ -172,20 +172,20 @@ services:
       - no-new-privileges:true
     shm_size: "256m"
 
-  gitlab-runner:
-    image: gitlab/gitlab-runner:alpine
-    volumes:
-      - gitlab_runner_home:/home/gitlab-runner
-      - gitlab_runner_config:/etc/gitlab-runner
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${PROJECT_DIR:?Set PROJECT_DIR}:${PROJECT_DIR:?Set PROJECT_DIR}:ro
-      - /usr/libexec/docker/cli-plugins/docker-buildx:/usr/local/lib/docker/cli-plugins/docker-buildx:ro
-    networks:
-      - edge_net
-    restart: unless-stopped
-    logging: *default-logging
-    security_opt:
-      - no-new-privileges:true
+  # gitlab-runner:
+  #   image: gitlab/gitlab-runner:alpine
+  #   volumes:
+  #     - gitlab_runner_home:/home/gitlab-runner
+  #     - gitlab_runner_config:/etc/gitlab-runner
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - ${PROJECT_DIR:?Set PROJECT_DIR}:${PROJECT_DIR:?Set PROJECT_DIR}:ro
+  #     - /usr/libexec/docker/cli-plugins/docker-buildx:/usr/local/lib/docker/cli-plugins/docker-buildx:ro
+  #   networks:
+  #     - edge_net
+  #   restart: unless-stopped
+  #   logging: *default-logging
+  #   security_opt:
+  #     - no-new-privileges:true
 
   jenkins:
     image: portfolio-jenkins:local

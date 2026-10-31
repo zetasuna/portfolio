@@ -4,8 +4,8 @@ global:
 route:
   receiver: default
   group_by: ["alertname", "job", "severity"]
-  group_wait: 30s
-  group_interval: 5m
+  group_wait: 0s
+  group_interval: 1s
   repeat_interval: 4h
 
 receivers:
@@ -17,11 +17,22 @@ receivers:
         bot_token: 8993198108:AAFeMDX8YgFccDXjF45M6tg_BN2BaZOsAjk
         chat_id: -1004445722502
         message: |
-          {{ if .CommonAnnotations.summary }}<b>🚨 {{ .CommonAnnotations.summary }}</b>{{ else }}<b>✅ {{ .CommonAnnotations.summary }}</b>{{ end }}
-          {{ if eq .CommonLabels.severity "critical" }}🔴 CRITICAL{{ else if eq .CommonLabels.severity "warning" }}🟠 WARNING{{ else }}🔵 {{ .CommonLabels.severity }}{{ end }}
-          🔧 {{ .CommonLabels.job }}
-          🖥️ {{ .CommonLabels.instance }}
-          {{ if .CommonAnnotations.description }}{{ .CommonAnnotations.description }}{{ end }}
+          {{- if eq .Status "resolved" }}
+          {{- range .Alerts.Resolved }}
+          <b>✅ Resolved: {{ .Annotations.summary }}</b>
+          🖥️ <b>Host:</b> {{ .Labels.instance }}
+          📝 <b>Detail:</b> {{ .Annotations.description }}
+          ⏰ <b>Time:</b> {{ .EndsAt.Format "15:04:05 on 2006.01.02" }}
+          {{- end }}
+          {{- else }}
+          {{- range .Alerts.Firing }}
+          <b>🚨 Problem: {{ .Annotations.summary }}</b>
+          🖥️ <b>Host:</b> {{ .Labels.instance }}
+          ⚡ <b>Severity:</b> {{ .Labels.severity }}
+          📝 <b>Detail:</b> {{ .Annotations.description }}
+          ⏰ <b>Time:</b> {{ .StartsAt.Format "15:04:05 on 2006.01.02" }}
+          {{- end }}
+          {{- end }}
 
 inhibit_rules:
   - source_matchers:
