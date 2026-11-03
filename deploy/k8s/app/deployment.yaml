@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portfolio
+  namespace: portfolio
+  labels:
+    app.kubernetes.io/name: portfolio
+    app.kubernetes.io/part-of: portfolio
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: portfolio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portfolio
+        app.kubernetes.io/part-of: portfolio
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # hostPath/local PVCs are not guaranteed to honour fsGroup, so make the
+        # uploads directory writable by the distroless non-root user explicitly.
+        - name: fix-perms
+          image: busybox:1.37
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - mkdir -p /app/uploads && chown -R 65532:65532 /app/uploads && chmod 0750 /app/uploads
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/uploads
+        - name: migrate
+          image: nam2107/portfolio:dc3aef79b8ac
+          imagePullPolicy: IfNotPresent
+          args: ["migrate"]
+          envFrom:
+            - configMapRef:
+                name: portfolio-app-config
+            - secretRef:
+                name: portfolio-db
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: portfolio
+          image: nam2107/portfolio:dc3aef79b8ac
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: portfolio-app-config
+            - secretRef:
+                name: portfolio-db
+          env:
+            - name: APP_INSTANCE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          # exec probes instead of httpGet: the app's Host allowlist would reject the
+          # kubelet's Pod-IP Host header. The built-in healthcheck calls 127.0.0.1,
+          # which is allowed, and checks DB readiness via /readyz.
+          startupProbe:
+            exec:
+              command: ["/app/portfolio", "healthcheck"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            exec:
+              command: ["/app/portfolio", "healthcheck"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness must not depend on the database, otherwise a DB blip restarts
+          # every app pod. A TCP check only verifies the HTTP listener is up.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/uploads
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: portfolio-uploads
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

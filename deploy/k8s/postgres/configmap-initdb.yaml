@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-initdb
+  namespace: portfolio
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: portfolio
+data:
+  # Runs only when the PostgreSQL data directory is initialized for the first time.
+  # Mirrors deploy/postgres/init/01-app-role.sh (the integration-test DB is not needed here).
+  10-app-role.sh: |
+    #!/bin/sh
+    set -eu
+    : "${APP_DB_USER:?APP_DB_USER is required}"
+    : "${APP_DB_PASSWORD:?APP_DB_PASSWORD is required}"
+    psql \
+      --username "$POSTGRES_USER" \
+      --dbname "$POSTGRES_DB" \
+      --set=ON_ERROR_STOP=1 \
+      --set=app_user="$APP_DB_USER" \
+      --set=app_password="$APP_DB_PASSWORD" <<'SQL'
+    SELECT format(
+      'CREATE ROLE %I WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT',
+      :'app_user', :'app_password'
+    ) \gexec
+    SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', current_database(), :'app_user') \gexec
+    SELECT format('GRANT USAGE, CREATE ON SCHEMA public TO %I', :'app_user') \gexec
+    SQL

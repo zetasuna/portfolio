@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-admin
+  namespace: portfolio
+  labels:
+    app.kubernetes.io/name: portfolio
+    app.kubernetes.io/component: create-admin
+    app.kubernetes.io/part-of: portfolio
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portfolio
+        app.kubernetes.io/component: create-admin
+        app.kubernetes.io/part-of: portfolio
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: create-admin
+          image: nam2107/portfolio:dc3aef79b8ac
+          imagePullPolicy: IfNotPresent
+          args: ["create-admin"]
+          envFrom:
+            - configMapRef:
+                name: portfolio-app-config
+            - secretRef:
+                name: portfolio-db
+            # Created ad hoc by scripts/k8s-create-admin.sh and deleted afterwards.
+            - secretRef:
+                name: portfolio-admin
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
