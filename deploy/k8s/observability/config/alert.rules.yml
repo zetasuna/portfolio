@@ -1,0 +1,39 @@
+groups:
+  - name: target-availability
+    rules:
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Prometheus target is DOWN
+          description: Target {{ $labels.job }} ({{ $labels.instance }}) has been unreachable for more than 2 minutes.
+
+  - name: portfolio-web-availability
+    rules:
+      - alert: PortfolioAppDown
+        expr: up{job="portfolio-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: portfolio-web
+        annotations:
+          summary: Portfolio web service is DOWN
+          description: Prometheus has been unable to scrape the portfolio app for more than 1 minute.
+
+  - name: container-resource-alerts
+    rules:
+      - alert: ContainerHighMemory
+        expr: |
+          (
+            container_memory_working_set_bytes{job="cadvisor", image!=""}
+            /
+            (container_spec_memory_limit_bytes{job="cadvisor", image!=""} > 0)
+          ) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Container memory usage is high
+          description: Container {{ $labels.name }} memory working set has exceeded 85% of its limit for 10 minutes.

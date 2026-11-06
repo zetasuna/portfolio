@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cadvisor
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: cadvisor
+    app.kubernetes.io/part-of: portfolio
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cadvisor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cadvisor
+        app.kubernetes.io/part-of: portfolio
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: cadvisor
+          image: gcr.io/cadvisor/cadvisor:v0.55.1
+          imagePullPolicy: IfNotPresent
+          args:
+            - --housekeeping_interval=15s
+            - --containerd=/run/containerd/containerd.sock
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: rootfs
+              mountPath: /rootfs
+              readOnly: true
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: run
+              mountPath: /run
+              readOnly: true
+            - name: var-lib-containerd
+              mountPath: /var/lib/containerd
+              readOnly: true
+            - name: dev-disk
+              mountPath: /dev/disk
+              readOnly: true
+      volumes:
+        - name: rootfs
+          hostPath:
+            path: /
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: run
+          hostPath:
+            path: /run
+        - name: var-lib-containerd
+          hostPath:
+            path: /var/lib/containerd
+        - name: dev-disk
+          hostPath:
+            path: /dev/disk
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cadvisor
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: cadvisor
+    app.kubernetes.io/part-of: portfolio
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cadvisor
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -15,13 +15,15 @@ data:
   # Requests always reach the app through the ingress controller, so forwarded headers are trusted.
   TRUST_PROXY_HEADERS: "true"
   # Host header check strips the port; add any extra hostnames you use (e.g. a real domain here).
-  ALLOWED_HOSTS: "portfolio.local,localhost,127.0.0.1"
+  # The in-cluster Service name is needed so Prometheus can scrape /metrics.
+  ALLOWED_HOSTS: "portfolio.local,localhost,127.0.0.1,portfolio.portfolio.svc.cluster.local"
   UPLOAD_DIR: "/app/uploads"
   MAX_UPLOAD_BYTES: "5242880"
   TEMPLATE_DIR: "/app/web/templates"
   STATIC_DIR: "/app/web/static"
   MIGRATIONS_DIR: "/app/migrations"
   OTEL_SERVICE_NAME: "portfolio-app"
-  # No collector is deployed yet; the OTLP gRPC client dials lazily, so this is harmless.
-  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+  # Collector from deploy/k8s/observability. The gRPC client dials lazily, so a
+  # missing collector does not stop the app from starting.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
   OTEL_TRACES_SAMPLER_ARG: "1.0"

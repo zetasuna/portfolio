@@ -1,0 +1,40 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: observability
+resources:
+  - namespace.yaml
+  - prometheus.yaml
+  - cadvisor.yaml
+  - loki.yaml
+  - tempo.yaml
+  - otel-collector.yaml
+  - alloy.yaml
+  - grafana.yaml
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml=config/prometheus.yml
+      - alert.rules.yml=config/alert.rules.yml
+  - name: loki-config
+    files:
+      - loki.yml=config/loki.yml
+  - name: tempo-config
+    files:
+      - tempo.yml=config/tempo.yml
+  - name: otel-collector-config
+    files:
+      - collector.yml=config/otel-collector.yml
+  - name: alloy-config
+    files:
+      - config.alloy=config/alloy.alloy
+  - name: grafana-datasources
+    files:
+      - datasources.yml=config/grafana-datasources.yml
+  - name: grafana-dashboard-provider
+    files:
+      - dashboards.yml=config/grafana-dashboards.yml
+  - name: grafana-dashboards
+    files:
+      - cadvisor-containers.json=config/dashboards/cadvisor-containers.json
+      - node-exporter-overview.json=config/dashboards/node-exporter-overview.json
+      - portfolio-overview.json=config/dashboards/portfolio-overview.json

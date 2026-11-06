@@ -1,0 +1,59 @@
+// Tails logs of pods in the portfolio namespace through the Kubernetes API.
+// Only the JSON fields used for filtering are promoted to labels so Loki
+// cardinality stays bounded (request/trace IDs stay inside the log line).
+
+discovery.kubernetes "pods" {
+  role = "pod"
+}
+
+discovery.relabel "portfolio_pods" {
+  targets = discovery.kubernetes.pods.targets
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    regex         = "portfolio"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+}
+
+loki.source.kubernetes "portfolio_pods" {
+  targets    = discovery.relabel.portfolio_pods.output
+  forward_to = [loki.process.app.receiver]
+}
+
+loki.process "app" {
+  stage.json {
+    expressions = {
+      level      = "level",
+      service    = "service",
+      instance   = "instance",
+      trace_id   = "trace_id",
+      request_id = "request_id",
+    }
+  }
+
+  stage.labels {
+    values = {
+      level   = "level",
+      service = "service",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+  }
+}

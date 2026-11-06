@@ -1,0 +1,40 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: minikube
+
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  # The in-cluster Service for the Go app. Its Host header is added to
+  # ALLOWED_HOSTS in deploy/k8s/app/configmap.yaml, otherwise the app's
+  # Host allowlist would reject the scrape with HTTP 421.
+  - job_name: portfolio-app
+    metrics_path: /metrics
+    scrape_timeout: 5s
+    static_configs:
+      - targets: ["portfolio.portfolio.svc.cluster.local:80"]
+        labels:
+          app_instance: portfolio
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor.observability.svc.cluster.local:8080"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki.observability.svc.cluster.local:3100"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo.observability.svc.cluster.local:3200"]
+
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector.observability.svc.cluster.local:8888"]

@@ -164,6 +164,7 @@ minikube ssh -- sudo crictl pull nam2107/portfolio:dc3aef79b8ac
 **App restarts, `DATABASE_URL is required` or `postgres remained unavailable`**
 
 ```bash
+kubectl -n observability get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d; echo
 kubectl -n portfolio get secret portfolio-db -o jsonpath='{.data.DATABASE_URL}' | base64 -d; echo
 kubectl -n portfolio logs statefulset/postgres --tail=100
 kubectl -n portfolio exec statefulset/postgres -- psql -U portfolio_admin -d portfolio -c '\du'
@@ -203,10 +204,25 @@ kubectl -n portfolio rollout restart deployment/portfolio
 
 **Tracing/OTLP errors in logs**
 
-Expected: no collector is deployed. Either ignore them or deploy an OTel Collector and point
-`OTEL_EXPORTER_OTLP_ENDPOINT` at its Service.
+Until the observability stack is deployed there is no collector, so OTLP export warnings are
+expected. Deploy it with `./scripts/k8s-monitoring-deploy.sh` (see
+[`observability/README.md`](observability/README.md)); the app then sends traces to
+`otel-collector.observability.svc.cluster.local:4317`.
 
-## 7. Reset the database (destroys data)
+## 7. Monitoring (metrics, logs, traces)
+
+The `deploy/k8s/observability` stack adds Prometheus + cAdvisor (metrics), Loki + Alloy (logs),
+Tempo + OTel Collector (traces) and Grafana. Full runbook:
+[`observability/README.md`](observability/README.md).
+
+```bash
+chmod +x scripts/k8s-monitoring-deploy.sh
+./scripts/k8s-monitoring-deploy.sh
+echo "$(minikube ip) grafana.local portfolio.local" | sudo tee -a /etc/hosts
+# Grafana: http://grafana.local
+```
+
+## 8. Reset the database (destroys data)
 
 ```bash
 kubectl -n portfolio scale statefulset/postgres --replicas=0
@@ -217,10 +233,12 @@ kubectl -n portfolio rollout status statefulset/postgres --timeout=300s
 
 If you also rotated `portfolio-db`, delete and recreate it first, then scale back up.
 
-## 8. Teardown
+## 9. Teardown
 
 ```bash
-./scripts/k8s-teardown.sh                # deletes the namespace (DB + uploads included)
-./scripts/k8s-teardown.sh --disable-ingress
-sudo sed -i '/portfolio\.local/d' /etc/hosts
+./scripts/k8s-teardown.sh                          # app only (DB + uploads included)
+./scripts/k8s-teardown.sh monitoring               # observability stack only
+./scripts/k8s-teardown.sh all                      # both
+./scripts/k8s-teardown.sh all --disable-ingress    # also disable the ingress addon
+sudo sed -i '/\(portfolio\|grafana\)\.local/d' /etc/hosts
 ```
