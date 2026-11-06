@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Start (or rebuild) the Jenkins controller and its permanent CI agent.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ -f .env ]] || {
@@ -9,7 +10,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PROJECT_DIR="$(pwd -P)"
 
 docker compose \
-  --env-file ${PROJECT_DIR}/.env \
-  -f ${PROJECT_DIR}/compose_jenkins.yaml \
-  up -d --build
-docker compose ps
+  --env-file "${PROJECT_DIR}/.env" \
+  --profile ci \
+  -f "${PROJECT_DIR}/compose.yaml" \
+  up -d --build jenkins jenkins-agent
+docker compose --env-file "${PROJECT_DIR}/.env" --profile ci ps jenkins jenkins-agent

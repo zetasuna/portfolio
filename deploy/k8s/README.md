@@ -116,7 +116,21 @@ BASE_URL=http://portfolio.local ./scripts/curl-crud.sh
 
 ## 5. Day-2 operations
 
-Deploy a new image tag (the `migrate` init container must be updated too):
+> **Argo CD owns these namespaces after bootstrap.** See
+> [`../argocd/README.md`](../argocd/README.md). The manual commands below are
+> bootstrap/emergency fallbacks; Argo CD will revert drift on its next sync.
+
+Deploy a new image tag through the pipeline (recommended). For an emergency,
+update the tag in `deploy/k8s/kustomization.yaml` and apply it:
+
+```bash
+NEW_TAG=dc3aef79b8ac
+(cd deploy/k8s && kustomize edit set image nam2107/portfolio=nam2107/portfolio:"$NEW_TAG")
+kubectl apply -k deploy/k8s
+kubectl -n portfolio rollout status deployment/portfolio --timeout=300s
+```
+
+Or, without kustomize:
 
 ```bash
 NEW_TAG=dc3aef79b8ac
@@ -126,8 +140,9 @@ kubectl -n portfolio set image deployment/portfolio \
 kubectl -n portfolio rollout status deployment/portfolio --timeout=300s
 ```
 
-Or edit the tag in `deploy/k8s/app/deployment.yaml` (and `deploy/k8s/jobs/create-admin-job.yaml`)
-and run `kubectl apply -k deploy/k8s`.
+The image tag lives in `deploy/k8s/kustomization.yaml` (`images:`), not in
+`deployment.yaml`; changing the tag there is enough for both the `migrate` init
+container and the app container.
 
 Change non-secret settings (allowed hosts, public URL, cookie flags):
 

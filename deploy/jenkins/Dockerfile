@@ -19,4 +19,10 @@ COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/
 
 RUN mkdir -p /usr/local/lib/docker/cli-plugins \
   && chown -R jenkins:jenkins /usr/local/lib/docker
+
+# Plugins the Jenkinsfile needs. Installed into the image so a fresh
+# jenkins_home can run the pipeline without manual plugin setup.
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
+
 USER jenkins

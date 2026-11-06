@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Pinned Argo CD release. `install.yaml` is vendored from:
+#   https://github.com/argoproj/argo-cd/releases/tag/v3.6.1
+# Upgrade by replacing install.yaml with the manifest from the new release and
+# updating the version in deploy/argocd/README.md.
+namespace: argocd
+resources:
+  - namespace.yaml
+  - install.yaml
+  - ingress.yaml
+patches:
+  # Poll Git more often than the 3 minute default so a pushed image tag rolls
+  # out quickly. GitHub -> Argo webhooks are optional and not required.
+  - target:
+      kind: ConfigMap
+      name: argocd-cm
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-cm
+      data:
+        timeout.reconciliation: 60s
+  # Terminate TLS at the ingress; the API server talks plain HTTP behind it.
+  - target:
+      kind: ConfigMap
+      name: argocd-cmd-params-cm
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-cmd-params-cm
+      data:
+        server.insecure: "true"

@@ -10,6 +10,13 @@ JOB="create-admin"
 
 command -v kubectl >/dev/null || { echo "ERROR: 'kubectl' is required" >&2; exit 1; }
 
+# Keep the one-shot Job on the same image Argo CD deploys. The Job is not part
+# of the kustomization (it must not be auto-applied), so resolve the tag here.
+if [[ -z "${IMAGE:-}" ]]; then
+  IMAGE="$(kubectl kustomize deploy/k8s | awk '/image: nam2107\/portfolio:/{print $2; exit}')"
+fi
+[[ -n "$IMAGE" ]] || { echo "ERROR: could not resolve the portfolio image tag" >&2; exit 1; }
+
 read -r -p 'Admin username (3-80 characters): ' ADMIN_USERNAME
 read -r -s -p 'Admin password (at least 12 characters): ' ADMIN_PASSWORD
 echo
@@ -31,8 +38,9 @@ kubectl -n "$NAMESPACE" create secret generic "$ADMIN_SECRET" \
   --from-literal=ADMIN_USERNAME="$ADMIN_USERNAME" \
   --from-literal=ADMIN_PASSWORD="$ADMIN_PASSWORD"
 
-echo "==> Running $JOB job"
-kubectl -n "$NAMESPACE" apply -f deploy/k8s/jobs/create-admin-job.yaml
+echo "==> Running $JOB job (image $IMAGE)"
+sed "s|image: nam2107/portfolio:[^ ]*|image: ${IMAGE}|g" \
+  deploy/k8s/jobs/create-admin-job.yaml | kubectl -n "$NAMESPACE" apply -f -
 
 if ! kubectl -n "$NAMESPACE" wait --for=condition=complete "job/$JOB" --timeout=180s; then
   echo "ERROR: admin bootstrap failed; logs:" >&2

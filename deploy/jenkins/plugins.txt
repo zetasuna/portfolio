@@ -1,0 +1,10 @@
+credentials-binding
+docker-plugin
+docker-workflow
+git
+github
+github-branch-source
+junit
+timestamper
+workflow-aggregator
+ws-cleanup

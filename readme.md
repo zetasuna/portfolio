@@ -10,6 +10,7 @@ Portfolio CRUD là một modular monolith viết bằng Go, render HTML phía se
 - [x] PostgreSQL
 - [x] GitLab
 - [x] Jenkins
+- [x] Argo CD
 - [x] Prometheus
 - [x] Grafana
 - [x] Loki
@@ -24,7 +25,7 @@ Portfolio CRUD là một modular monolith viết bằng Go, render HTML phía se
 - Bảo mật: Argon2id, server-side session trong PostgreSQL (chỉ lưu hash session token), CSRF, rate limit, security headers/CSP, Host allowlist, parameterized SQL, URL HTTPS validation, upload JPEG/PNG qua decode và giới hạn kích thước. App dùng database role không có quyền superuser; bootstrap DB role riêng.
 - Vận hành: health/readiness endpoints, graceful shutdown, PostgreSQL connection pool, Docker non-root, Nginx load balancing.
 - Observability: Prometheus metrics, JSON logs qua stdout/stderr → Alloy → Loki, trace HTTP/DB → OTLP Collector → Tempo; Grafana datasource/dashboard được provisioning.
-- CI/CD: Jenkins pipeline có format, vet, tests, coverage, `govulncheck`, build image, Trivy scan; publish/deploy chỉ trên `main`/tag được tin cậy.
+- CI/CD: GitHub → Jenkins (format, vet, tests, coverage, `govulncheck`, build, Trivy scan) → Docker Hub → Argo CD (GitOps, app + monitoring). Publish/deploy chỉ trên `main`.
 
 ## 2. Kiến trúc
 
@@ -54,8 +55,11 @@ flowchart TB
   G[Grafana] --> P
   G --> L
   G --> T
-  J[Jenkins] --> DH[Docker Hub]
-  J --> N
+  GH[GitHub] --> J[Jenkins CI]
+  J --> DH[Docker Hub]
+  J --> GB[Git branch deploy]
+  GB --> AC[Argo CD]
+  AC --> N
 ```
 
 Compose defines exactly 12 long-running services: `app1`, `app2`, `app3`, `postgres`, `nginx`, `jenkins`, `grafana`, `prometheus`, `loki`, `tempo`, `otel-collector`, `alloy`. One-shot migration/integration/smoke containers are temporary jobs, not persistent services.
@@ -254,36 +258,106 @@ docker compose start app2
 ./scripts/smoke.sh
 ```
 
-## 9. Jenkins, GitHub webhook và Docker Hub
+## 9. CI/CD: GitHub → Jenkins → Docker Hub → Argo CD
 
-### 9.1. Kết nối Jenkins
+### 9.1. Kiến trúc
 
-1. Mở `http://127.0.0.1:8081`, hoàn tất initial setup nếu được yêu cầu.
-2. Tạo Multibranch Pipeline hoặc Pipeline-from-SCM trỏ tới GitHub repository.
-3. Trong GitHub repository, đặt Webhook URL về endpoint Jenkins có thể truy cập từ GitHub. Webhook `http://127.0.0.1:8081` không thể nhận webhook từ Internet; cần hostname HTTPS reachable, VPN/tunnel có kiểm soát hoặc runner/agent đặt ở network phù hợp. Không port-forward Jenkins thẳng ra Internet.
-4. Chọn webhook events tối thiểu là push và pull request/branch indexing phù hợp với job policy.
+```mermaid
+flowchart LR
+  GH[GitHub main] -- webhook qua ngrok --> J[Jenkins controller]
+  J --> A[Jenkins agent<br/>docker-go]
+  A -- unit/integration/scan --> A
+  A -- push --> DH[Docker Hub<br/>nam2107/portfolio:SHA]
+  A -- commit tag --> GB[Git branch deploy]
+  AC[Argo CD] -- poll 60s --> GB
+  AC -- sync --> P[namespace portfolio]
+  AC -- sync --> O[namespace observability]
+```
 
-### 9.2. Jenkins Credentials
+- **Jenkins = CI.** Format, vet, unit test, database integration test, `govulncheck`, build, Trivy scan, push image. Không chạy `kubectl`.
+- **Git = nguồn sự thật.** Pipeline copy manifest từ `main` sang branch `deploy` và chỉ đổi image tag.
+- **Argo CD = CD duy nhất.** Nhận thay đổi từ branch `deploy`, sync cả app và monitoring.
+- Rollback = `argocd app rollback` hoặc `git revert` commit trên branch `deploy`.
 
-Tạo Credentials với ID chính xác:
+`deploy/argocd/` chứa manifest cài Argo CD và hai Application. `deploy/ci/` chứa
+image agent. Hướng dẫn chi tiết: [`deploy/argocd/README.md`](deploy/argocd/README.md)
+và [`deploy/ci/README.md`](deploy/ci/README.md).
 
-| ID                      | Loại        | Nội dung                                                                                 |
-| ----------------------- | ----------- | ---------------------------------------------------------------------------------------- |
-| `dockerhub-username`    | Secret text | Docker Hub username                                                                      |
-| `dockerhub-token`       | Secret text | Docker Hub access token với quyền cần thiết                                              |
-| `portfolio-runtime-env` | Secret file | Bản `.env` runtime đã được review, `PROJECT_DIR` là đường dẫn tuyệt đối trên Docker host |
+### 9.2. Cài đặt một lần
 
-Jenkins chạy cùng Docker host, mount `/var/run/docker.sock`; quyền điều khiển socket trên thực tế rất mạnh, gần tương đương quyền quản trị host. **Không chạy Jenkinsfile từ fork hoặc pull request chưa tin cậy trên Jenkins này.** Chỉ build/publish/deploy nhánh/tag đáng tin cậy. Jenkins không chạy `privileged`; tuy vậy socket access vẫn là rủi ro nghiêm trọng. Cân nhắc tách build worker hoặc dùng remote build service cho môi trường quan trọng.
+```bash
+# 1. Jenkins controller + agent.
+#    Trong Jenkins: Manage Jenkins -> Nodes -> New node
+#      name: ci-agent, label: docker-go, remote root: /home/jenkins/agent
+#    Copy secret vào .env (JENKINS_AGENT_SECRET), rồi:
+./scripts/deploy_jenkins.sh
 
-Pipeline làm checkout, gofmt, vet, unit tests/coverage, database integration tests trên branch `main`, `govulncheck`, build, Trivy image scan, publish image và deploy chỉ trên `main`/tag. Deployment chạy smoke test và cố gắng quay lại image đã triển khai trước nếu smoke fail.
+# 2. Argo CD + hai Application (tự tạo branch deploy nếu chưa có)
+./scripts/argocd-bootstrap.sh
 
-### 9.3. Điều kiện publish/deploy
+# 3. Host entry cho Argo UI
+echo "$(minikube ip) argocd.local" | sudo tee -a /etc/hosts
+```
 
-- Multibranch job cần nhận diện `main` đúng là branch deploy tin cậy.
-- File Credentials `portfolio-runtime-env` phải phản ánh runtime Compose hiện hành và host path thật.
-- Docker Hub token chỉ có scope cần thiết; không sử dụng mật khẩu tài khoản chính.
-- Khi pipeline fail, xem stage failure và không bỏ qua lỗi vulnerability scan mà không có quyết định/risk acceptance rõ ràng.
-- Rollback image không tự động rollback database migration. Migration phải giữ tương thích ngược; migration phá hủy cần quy trình riêng.
+Chi tiết agent: [`deploy/ci/README.md`](deploy/ci/README.md).
+
+Sau khi cài, `kubectl apply -k deploy/k8s` chỉ dùng để bootstrap hoặc xử lý sự cố.
+Argo CD sở hữu namespace `portfolio` và `observability`; thay đổi manifest phải đi qua Git.
+
+### 9.3. Jenkins Credentials
+
+| ID                      | Loại              | Nội dung                                                        |
+| ----------------------- | ----------------- | --------------------------------------------------------------- |
+| `dockerhub`             | Username/password | Docker Hub username + access token (scope tối thiểu)            |
+| `github-gitops`         | Secret text       | GitHub PAT chỉ có quyền push branch `deploy`                    |
+| `argocd-admin-password` | Secret text       | Password admin Argo CD (chỉ dùng để `argocd app wait`)          |
+
+Không commit token vào repository. Token Docker Hub từng nằm trong
+`.gitlab-ci.yml` cũ đã bị xoá; token đó phải được **revoke** trên Docker Hub.
+
+### 9.4. GitHub webhook qua ngrok
+
+```bash
+ngrok http 8081 --domain=<reserved>.ngrok-free.app --basic-auth=<user>:<pass>
+```
+
+- Đặt Jenkins URL thành `https://<reserved>.ngrok-free.app`.
+- GitHub → Settings → Webhooks: URL `https://<reserved>.ngrok-free.app/github-webhook/`
+  (nếu bật `--basic-auth`, dùng `https://<user>:<pass>@<reserved>.ngrok-free.app/github-webhook/`),
+  content type `application/json`, secret trùng với Jenkins, events `push` và `pull_request`.
+- Tạo Multibranch Pipeline trỏ tới repository.
+
+**Cảnh báo:** Jenkins mount `/var/run/docker.sock`, tức là gần tương đương quyền root
+trên host. ngrok mở toàn bộ UI Jenkins ra Internet. Bắt buộc bật basic auth, mật khẩu
+admin mạnh, webhook secret, tắt anonymous access; tốt hơn là đặt reverse proxy chỉ cho
+`/github-webhook/` hoặc dùng Cloudflare Tunnel + Access. Không expose agent port/Jenkins CLI.
+
+### 9.5. Luồng pipeline
+
+| Stage | Nội dung |
+| --- | --- |
+| Checkout | `TAG=sha-<12>` |
+| Format & vet | `gofmt`, `go vet` |
+| Unit tests | `gotestsum`, race, coverage, JUnit |
+| Database integration | PostgreSQL 18 tạm + `tests/integration` |
+| Dependency scan | `govulncheck` |
+| Build | `docker build --pull` |
+| Image scan | Trivy: fail ở CRITICAL, báo cáo HIGH |
+| Publish | Chỉ `main`; push `nam2107/portfolio:$TAG` |
+| GitOps bump | Copy `deploy/` sang branch `deploy`, `kustomize edit set image` |
+| Wait for Argo | `argocd app wait` cho app và monitoring |
+| Smoke | `scripts/k8s-smoke.sh` qua ingress |
+
+PR chỉ chạy CI. Publish/GitOps/deploy chỉ chạy trên `main`. Pipeline dùng
+`disableConcurrentBuilds()` để tránh hai lần bump chồng nhau.
+
+### 9.6. Lưu ý vận hành
+
+- Docker Hub token chỉ có scope cần thiết; không dùng mật khẩu tài khoản chính.
+- Trivy có thể báo false positive; nếu chấp nhận rủi ro phải ghi lại quyết định, không tắt gate im lặng.
+- Rollback image không rollback database migration. Migration phải tương thích ngược.
+- `create-admin` Job không nằm trong kustomization; `scripts/k8s-create-admin.sh` tự lấy tag từ kustomization để không lệch image.
+- Alloy hiện chưa ready nên Application `portfolio-observability` có thể báo `Degraded`; đây là lỗi workload có sẵn, không phải lỗi sync.
 
 ## 10. HTTPS / triển khai ngoài localhost
 
@@ -318,7 +392,9 @@ Named volumes giữ dữ liệu qua việc recreate container, không phải bac
 
 **Tempo trống:** gửi HTTP traffic mới, chờ batch exporter, xem `docker compose logs app1 app2 app3 otel-collector tempo`; xác minh OTLP gRPC 4317 và mạng `obs_net`.
 
-**Jenkins không deploy/không tìm thấy path:** `portfolio-runtime-env` cần host-side `PROJECT_DIR`; Docker socket dùng đường dẫn phía Docker host, không phải path container. Đọc stage log trước khi thử chạy lại.
+**Jenkins agent không start:** kiểm tra service `jenkins-agent` trong `docker compose ps`, `JENKINS_AGENT_SECRET` trong `.env`, quyền `docker.sock` và outbound Internet. Agent phải chạy user `root` và có `host.docker.internal`/`argocd.local` trong `extra_hosts`.
+
+**Argo CD không sync:** kiểm tra branch `deploy` đã được push chưa, `argocd app get portfolio-app`, và log `argocd-repo-server`. Nếu `portfolio-observability` báo `Degraded` do Alloy, xem readiness probe của DaemonSet đó.
 
 **Lỗi tải Go modules:** cần outbound Internet/DNS tới proxy/module hosting ở lần đầu; đảm bảo `go.sum` đã được tạo/commit từ máy có mạng và không xóa checksum khi CI build.
 

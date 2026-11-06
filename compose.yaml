@@ -220,6 +220,34 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  jenkins-agent:
+    image: portfolio-ci:local
+    profiles: ["ci"]
+    build:
+      context: ${PROJECT_DIR:?Set PROJECT_DIR}/deploy/ci
+      dockerfile: Dockerfile
+    environment:
+      JENKINS_URL: http://jenkins:8080
+      JENKINS_AGENT_NAME: ${JENKINS_AGENT_NAME:-ci-agent}
+      JENKINS_AGENT_WORKDIR: /home/jenkins/agent
+      # Copy this from the Jenkins node page when creating the permanent agent.
+      JENKINS_SECRET: ${JENKINS_AGENT_SECRET:-}
+    user: root
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - jenkins_agent_work:/home/jenkins/agent
+    networks:
+      - edge_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      # Argo CD CLI in the agent reaches the ingress by Host header.
+      - "argocd.local:192.168.49.2"
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      jenkins:
+        condition: service_healthy
+
   grafana:
     image: grafana/grafana:latest
     ports:
@@ -472,6 +500,7 @@ volumes:
   gitlab_runner_home:
   gitlab_runner_config:
   jenkins_home:
+  jenkins_agent_work:
   grafana_data:
   prometheus_data:
   alertmanager_data:

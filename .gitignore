@@ -4,6 +4,7 @@
 uploads/
 coverage.out
 coverage.html
+reports/
 *.log
 *.zip
 .DS_Store
