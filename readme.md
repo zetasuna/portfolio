@@ -1,528 +1,1663 @@
-# Portfolio CRUD — Go, Docker Compose, Kubernetes, CI/CD và Observability
+# Portfolio CRUD — Kubernetes (minikube) with GitOps, Observability & CI/CD
 
-Portfolio CRUD là một **modular monolith** viết bằng Go, render HTML phía server (SSR) và chạy ba app instance phía sau Nginx. Repo cung cấp hai cách vận hành:
+A **Go modular monolith** that renders a portfolio site server-side (SSR) and exposes a small admin
+CRUD UI. The project's main deployment target is a local **minikube** cluster driven by
+**Kustomize + Argo CD**, with a full metrics/logs/traces stack and a Jenkins pipeline that publishes
+images and bumps the GitOps branch.
 
-- **Docker Compose** cho môi trường homelab: app, PostgreSQL, Nginx, Jenkins, GitLab CE và stack observability.
-- **Kubernetes (minikube)** cho phần app và monitoring, triển khai theo GitOps bằng **Argo CD**.
+The app itself is deliberately simple: one Go binary, PostgreSQL, local file storage for thumbnails.
+The interesting part of this repository is everything around it — reproducible manifests, a
+least-privilege database setup, a non-root distroless container, a complete observability stack, and
+a CI/CD flow where Jenkins never touches the cluster.
 
-Pipeline CI/CD hiện tại: **GitHub → Jenkins (CI) → Docker Hub → Argo CD (CD)**. Jenkins chỉ build/test/scan/push image và cập nhật branch GitOps; Jenkins **không** chạy `kubectl`.
+| Mode | Status | How it deploys |
+| --- | --- | --- |
+| **Kubernetes (primary)** | Production-like lab | Kustomize manifests, Argo CD GitOps |
+| **Docker Compose (appendix)** | Local dev/demo | `docker compose up` |
 
-> **Trạng thái:** source, Compose config, manifest Kubernetes/Argo CD, pipeline Jenkins, unit test và integration test với PostgreSQL 18 đã được kiểm tra trong quá trình phát triển. Các bước cần credential thật (webhook GitHub, push Docker Hub, Argo CD sync) phải được kiểm tra lại trên môi trường của bạn. Xem thêm [`VERIFICATION.md`](VERIFICATION.md), lưu ý tài liệu này được tạo trong môi trường đóng gói ban đầu và có thể lỗi thời so với trạng thái hiện tại.
+Pipeline overview:
 
-## 1. Tính năng
+```text
+GitHub ──► Jenkins (CI) ──► Docker Hub ──► branch `deploy` ──► Argo CD (CD) ──► minikube
+                  │                                              ▲
+                  └── never runs kubectl; only pushes image + manifests
+```
 
-- **Public:** trang chủ, danh sách project có phân trang, chi tiết project; chỉ project `published` được công khai.
-- **Admin:** đăng nhập/đăng xuất, dashboard thống kê, CRUD project, draft/published, upload/thay/xóa thumbnail.
-- **Bảo mật:** Argon2id, session lưu trong PostgreSQL (chỉ lưu hash session token), CSRF, rate limit, security headers/CSP, Host allowlist, parameterized SQL, kiểm tra URL HTTPS, upload JPEG/PNG qua decode và giới hạn kích thước. App dùng database role không có quyền superuser.
-- **Vận hành:** health/readiness endpoints, graceful shutdown, connection pool, container chạy non-root, Nginx load balancing.
-- **Observability:** Prometheus metrics, JSON logs → Alloy → Loki, trace HTTP/DB → OTLP Collector → Tempo, Grafana provision datasource/dashboard.
-- **CI/CD:** gofmt/vet, unit test, integration test với PostgreSQL thật, `govulncheck`, build image, Trivy scan, push Docker Hub, cập nhật branch `deploy`; Argo CD sync app + monitoring.
+> **Status:** the Kubernetes manifests, Kustomize rendering, Jenkins pipeline structure, unit tests
+> and the PostgreSQL 18 integration tests were exercised during development. The Argo CD manifests
+> were reviewed, but Argo CD was not installed into the cluster during the last validation and the
+> `deploy` branch was not pushed. Steps that require real credentials (GitHub webhook, Docker Hub
+> push, Argo CD sync) must be re-verified in your own environment. See
+> [Verification](#17-documentation-and-verification).
 
-## 2. Kiến trúc
+---
 
-### 2.1. Runtime với Docker Compose
+## Contents
+
+1. [Overview](#1-overview)
+2. [Feature summary](#2-feature-summary)
+3. [Architecture on minikube](#3-architecture-on-minikube)
+4. [Prerequisites](#4-prerequisites)
+5. [Quick start](#5-quick-start)
+6. [Repository layout](#6-repository-layout)
+7. [Application + PostgreSQL on minikube](#7-application--postgresql-on-minikube)
+8. [Observability stack](#8-observability-stack)
+9. [Argo CD and GitOps](#9-argo-cd-and-gitops)
+10. [CI/CD pipeline](#10-cicd-pipeline)
+11. [Day-2 operations](#11-day-2-operations)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Teardown](#13-teardown)
+14. [Security notes](#14-security-notes)
+15. [Appendix A — Docker Compose](#15-appendix-a--docker-compose)
+16. [Appendix B — Kubernetes vs Compose](#16-appendix-b--kubernetes-vs-compose)
+17. [Documentation and verification](#17-documentation-and-verification)
+
+---
+
+## 1. Overview
+
+### What the application does
+
+- **Public site:** home page, paginated project list, project detail page. Only projects with
+  `status = 'published'` are visible publicly.
+- **Admin area:** session login/logout, dashboard, create/update/delete projects, draft vs published
+  status, thumbnail upload/replace/delete.
+- **Tech:** Go 1.27, `chi` router, `pgx` connection pool, `golang-migrate`, `html/template`,
+  `prometheus/client_golang`, OpenTelemetry OTLP tracing, PostgreSQL 18, distroless static image.
+
+### How it is deployed
+
+- **minikube** with the `ingress` addon. Three hostnames map into three namespaces:
+  `portfolio.local`, `grafana.local`, `argocd.local`.
+- **Kustomize** is the renderer. The image tag lives in exactly one place:
+  `deploy/k8s/kustomization.yaml`.
+- **Argo CD** watches the `deploy` branch and reconciles two Applications.
+- **Jenkins** runs tests/scans/build, pushes to Docker Hub, then copies manifests to `deploy` and
+  bumps the tag. It has no cluster credentials.
+- **Compose** remains available as a single-host development environment (three app instances
+  behind Nginx), documented in [Appendix A](#15-appendix-a--docker-compose).
+
+### Design principles
+
+- The application container is **non-root (uid/gid 65532)**, runs from a distroless image, drops all
+  capabilities and uses a read-only root filesystem.
+- The application connects to PostgreSQL as a **non-superuser role** created on first database
+  initialization. The bootstrap admin role is never used by the app.
+- Secrets (`portfolio-db`, `grafana-admin`, `argocd-initial-admin-secret`) are generated by scripts
+  and **never committed**.
+- The app starts even when the observability collector is absent; OTLP export failures are warnings,
+  not startup failures.
+
+---
+
+## 2. Feature summary
+
+### Public
+
+- Home page with the most recent published projects.
+- `/projects` with pagination.
+- `/projects/{slug}` project detail.
+- Static assets under `/static/`; uploaded thumbnails under `/uploads/{name}`.
+- `/healthz` (liveness) and `/readyz` (database readiness).
+
+### Admin
+
+- `/admin/login` and `/admin/logout`.
+- `/admin` dashboard.
+- `/admin/projects` list, `/admin/projects/new`, `/admin/projects/{id}/edit`.
+- Create, update and delete projects; upload/replace/delete thumbnails.
+- Draft/published state controls public visibility.
+
+### Security controls
+
+| Control | Implementation |
+| --- | --- |
+| Password hashing | Argon2id (`internal/auth/password.go`) |
+| Sessions | Opaque random tokens; only SHA-256 hashes stored in PostgreSQL |
+| CSRF | Per-session token validated with constant-time compare on state-changing admin routes |
+| Rate limiting | `/admin/login` and admin mutations are rate-limited per client IP |
+| Host allowlist | Rejects requests whose `Host` header is not in `ALLOWED_HOSTS` |
+| Security headers | CSP, `X-Frame-Options: DENY`, `nosniff`, referrer policy, permissions policy |
+| Upload safety | JPEG/PNG only, decoded and dimension-checked, 5 MiB application limit |
+| SQL safety | Parameterized queries via `pgx` |
+| Proxy trust | Forwarded headers trusted only when `TRUST_PROXY_HEADERS=true` (behind the ingress) |
+| Container | Non-root, read-only rootfs, `drop: ALL`, seccomp `RuntimeDefault`, no SA token |
+
+### Operational features
+
+- Hardened PostgreSQL StatefulSet with a PVC and a headless Service.
+- PVC-backed uploads directory with an init container that fixes ownership.
+- Rolling updates with `maxUnavailable: 0`, `maxSurge: 1`.
+- Probes that do not depend on the database for liveness.
+- Prometheus metrics, Grafana dashboards/datasources, Loki logs, Tempo traces, cAdvisor metrics.
+- Argo CD auto-sync with prune and self-heal.
+- Jenkins declarative pipeline with gofmt/vet, race tests, integration tests, `govulncheck`, Trivy,
+  image publish, GitOps bump, Argo wait and ingress smoke test.
+
+---
+
+## 3. Architecture on minikube
+
+### 3.1 Cluster overview
 
 ```mermaid
 flowchart TB
-  B[Browser] --> N[Nginx :8080]
-  N --> A1[app1]
-  N --> A2[app2]
-  N --> A3[app3]
-  A1 --> PG[(PostgreSQL)]
-  A2 --> PG
-  A3 --> PG
-  A1 --- U[(uploads volume)]
-  A2 --- U
-  A3 --- U
-  P[Prometheus] -. scrape /metrics .-> A1
-  P -. scrape /metrics .-> A2
-  P -. scrape /metrics .-> A3
-  A1 -. OTLP .-> O[OTel Collector]
-  A2 -. OTLP .-> O
-  A3 -. OTLP .-> O
-  O --> T[Tempo]
-  A1 -. JSON stdout .-> AL[Grafana Alloy]
-  A2 -. JSON stdout .-> AL
-  A3 -. JSON stdout .-> AL
+  B[Browser] --> I[ingress-nginx]
+
+  I -->|portfolio.local| S[Service portfolio]
+  S --> D[Deployment portfolio<br/>1 replica]
+  D --> PG[(PostgreSQL StatefulSet<br/>PVC 2Gi)]
+  D --- U[(PVC uploads 1Gi)]
+
+  D -. /metrics .-> P[Prometheus]
+  D -. OTLP gRPC .-> OC[OTel Collector]
+  OC --> T[Tempo]
+  D -. JSON stdout .-> AL[Alloy]
   AL --> L[Loki]
   G[Grafana] --> P
   G --> L
   G --> T
-  P --> AM[Alertmanager]
-  NE[node-exporter] --> P
-  CA[cAdvisor] --> P
+
+  I -->|grafana.local| G
+  I -->|argocd.local| AR[Argo CD]
+  AR -. sync deploy branch .-> D
+  AR -. sync deploy branch .-> P
 ```
 
-Compose định nghĩa **16 service mặc định** (chưa tính `jenkins-agent` ở profile `ci`):
+### 3.2 Namespaces and workloads
 
-| Nhóm | Service |
-| --- | --- |
-| Ứng dụng | `app1`, `app2`, `app3`, `nginx` |
-| Dữ liệu | `postgres` |
-| CI/CD | `jenkins`, `gitlab` |
-| Observability | `grafana`, `prometheus`, `alertmanager`, `node-exporter`, `cadvisor`, `loki`, `tempo`, `otel-collector`, `alloy` |
+| Namespace | Workload | Kind | Purpose |
+| --- | --- | --- | --- |
+| `portfolio` | `portfolio` | Deployment (1 replica) | Go app: `migrate` init container + `serve` container |
+| `portfolio` | `postgres` | StatefulSet (1 replica) | PostgreSQL 18, 2 Gi PVC |
+| `portfolio` | `portfolio-uploads` | PVC (1 Gi) | Uploaded thumbnails |
+| `portfolio` | `portfolio` | Service (ClusterIP) | `80 → 8080` |
+| `portfolio` | `portfolio` | Ingress | `portfolio.local` |
+| `portfolio` | `create-admin` | Job (on demand) | One-shot admin bootstrap |
+| `observability` | `prometheus`, `grafana`, `loki`, `tempo`, `otel-collector` | Deployments | Metrics, dashboards, logs, traces |
+| `observability` | `cadvisor`, `alloy` | DaemonSets | Container metrics, pod log collection |
+| `observability` | `grafana` | Ingress | `grafana.local` |
+| `argocd` | Argo CD + two Applications | Deployments/StatefulSet + CRs | GitOps CD |
+| `argocd` | `argocd` | Ingress | `argocd.local` |
 
-Ngoài ra có service **`jenkins-agent`** với profile `ci`, chỉ chạy khi bật profile này. Container migration, integration test và smoke test là job tạm thời, không phải service thường trực.
+### 3.3 Ingress and hostnames
 
-> **GitLab CE** vẫn có trong Compose cho mục đích thử nghiệm nhưng **không phải CI/CD chính** của repo. Pipeline hiện tại dùng GitHub + Jenkins. Có thể bỏ service `gitlab` nếu không sử dụng.
+| Hostname | Namespace | Backend | Notes |
+| --- | --- | --- | --- |
+| `portfolio.local` | `portfolio` | `portfolio:80 → 8080` | Body limit 10m, proxy read timeout 35s |
+| `grafana.local` | `observability` | `grafana:3000` | No TLS |
+| `argocd.local` | `argocd` | `argocd-server:80` | `server.insecure=true`, HTTP backend |
 
-### 2.2. CI/CD
+All routes go through the minikube `ingress-nginx` controller. There is **no TLS** in the lab. Use
+this only locally, on a trusted network, or behind a VPN/TLS proxy.
 
-```mermaid
-flowchart LR
-  GH[GitHub main] -- webhook qua ngrok --> J[Jenkins controller]
-  J --> A[Jenkins agent<br/>label docker-go]
-  A -- test/scan --> A
-  A -- push --> DH[Docker Hub<br/>nam2107/portfolio:SHA]
-  A -- commit tag --> GB[Git branch deploy]
-  AC[Argo CD] -- poll 60s --> GB
-  AC -- sync --> P[namespace portfolio]
-  AC -- sync --> O[namespace observability]
-```
+### 3.4 Request lifecycle (app)
 
-- **Jenkins = CI.** Format, vet, unit test, database integration test, `govulncheck`, build, Trivy scan, push image. Không chạy `kubectl`.
-- **Git = nguồn sự thật.** Pipeline copy manifest từ `main` sang branch `deploy` và chỉ đổi image tag.
-- **Argo CD = CD duy nhất.** Nhận thay đổi từ branch `deploy`, sync cả app và monitoring.
-- **Rollback** = `argocd app rollback` hoặc `git revert` commit trên branch `deploy`.
+1. Browser resolves `portfolio.local` to the minikube IP (via `/etc/hosts`).
+2. `ingress-nginx` matches the `Host` header and forwards to Service `portfolio`.
+3. The Service selects the app pod on port `8080`.
+4. Middleware chain runs: request ID → host allowlist → security headers → body limit →
+   session load → OTel HTTP → metrics/logging → request ID response header.
+5. The handler queries PostgreSQL through the `portfolio_app` role and renders an HTML template.
+6. Logs are emitted as one JSON object per line to stdout, where Alloy tails them.
+7. Metrics are exposed on `/metrics` for Prometheus.
+8. Traces are batched and exported over OTLP gRPC every ~2 seconds to the collector, then Tempo.
 
-### 2.3. Kubernetes / minikube
+### 3.5 Resource budget and storage
 
-| Application Argo CD | Đường dẫn | Namespace |
-| --- | --- | --- |
-| `portfolio-app` | `deploy/k8s` | `portfolio` |
-| `portfolio-observability` | `deploy/k8s/observability` | `observability` |
+| Component | CPU request | CPU limit | Memory request | Memory limit | Storage |
+| --- | --- | --- | --- | --- | --- |
+| App | 50m | 500m | 64Mi | 256Mi | uploads PVC 1Gi |
+| PostgreSQL | 100m | 500m | 256Mi | 512Mi | data PVC 2Gi |
+| Prometheus | 100m | 400m | 192Mi | 384Mi | 2Gi |
+| cAdvisor | 50m | 300m | 128Mi | 256Mi | host mounts |
+| Loki | 50m | 300m | 128Mi | 320Mi | 2Gi |
+| Tempo | 50m | 300m | 128Mi | 256Mi | 2Gi |
+| OTel Collector | 50m | 200m | 64Mi | 256Mi | — |
+| Alloy | 50m | 200m | 64Mi | 192Mi | emptyDir 512Mi |
+| Grafana | 100m | 1 core | 256Mi | 512Mi | 1Gi |
 
-Cả hai Application trỏ tới branch `deploy` của `https://github.com/zetasuna/portfolio.git`, bật auto-sync, self-heal và prune. Image tag app được quản lý duy nhất ở `deploy/k8s/kustomization.yaml` (`images[].newTag`), dùng chung cho container app và init container `migrate`.
+**Recommended minikube:** `4 CPU / 6 GiB RAM / 20 GiB disk` for app + observability.
+The default ~3.8 GiB node is very tight once Grafana, Prometheus, Loki and Tempo are running; expect
+`Pending` or `OOMKilled` on smaller nodes. For the app alone, `2 CPU / 4 GiB` is enough.
 
-### 2.4. Network và cổng host
+### 3.6 Kubernetes security posture
 
-Tất cả host port mặc định chỉ bind `127.0.0.1`.
+- Pod-level `seccompProfile: RuntimeDefault`.
+- `automountServiceAccountToken: false` on the app, PostgreSQL, Prometheus, Loki, Tempo, OTel
+  Collector, Grafana, cAdvisor.
+- App and init containers:
+  - `runAsNonRoot`, uid/gid `65532`
+  - `readOnlyRootFilesystem: true`
+  - `allowPrivilegeEscalation: false`
+  - `capabilities.drop: ["ALL"]`
+- Only the `fix-perms` init container runs as root, with the minimum extra capabilities
+  (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`) to fix the uploads volume.
+- `cadvisor` is privileged by necessity (host metrics); it mounts host paths read-only.
+- Alloy uses a namespaced ServiceAccount plus a cluster-scoped `ClusterRole` limited to
+  `pods`, `pods/log`, `namespaces`.
 
-| Service | Host port mặc định | Ghi chú |
-| --- | ---: | --- |
-| Website / Nginx | `8080` | Điểm truy cập website |
-| `app1` | `8081` | Truy cập trực tiếp để debug |
-| `app2` | `8082` | Truy cập trực tiếp để debug |
-| `app3` | `8083` | Truy cập trực tiếp để debug |
-| Jenkins | `8081` | **Trùng port `app1`** — xem cảnh báo bên dưới |
-| Grafana | `3000` | Dashboard, cần login |
-| Prometheus | `9090` | Metrics |
-| Alertmanager | `9093` | Alert UI |
-| Loki | `3100` | Log API |
-| Tempo | Không publish | Trace API nội bộ cổng `3200` |
-| OTLP | `4317` / `4318` | gRPC / HTTP |
-| PostgreSQL | `5432` | Chỉ nên dùng khi debug |
-| GitLab CE | `8070` / SSH `2424` | Không dùng cho pipeline hiện tại |
-| cAdvisor | `8078` | Container metrics |
-| node-exporter | `9100` | Host metrics |
+---
 
-> **Cảnh báo port:** `app1` mặc định dùng `8081`, trùng `JENKINS_HOST_PORT`. Nếu chạy Jenkins cùng lúc, đặt `APP1_HOST_PORT=18081` (hoặc đổi `JENKINS_HOST_PORT`) trong `.env` trước khi `docker compose up`.
+## 4. Prerequisites
 
-Các network `edge_net`, `app_net`, `db_net`, `obs_net` tách service theo vai trò. Tên network thực tế theo Compose project `portfolio`, ví dụ `portfolio_db_net`, `portfolio_obs_net`.
-
-**Đây không phải HA toàn hệ thống.** PostgreSQL, Nginx và các telemetry backend vẫn là điểm lỗi đơn. Ba app instance giúp cân bằng request và duy trì phục vụ khi một instance lỗi, không giải quyết lỗi database/host.
-
-## 3. Yêu cầu trước khi cài
-
-- Linux host có Docker Engine và Docker Compose v2 plugin.
-- Git, `curl`, `openssl`, Python 3 (script setup dùng Python để ghi `.env`).
-- Internet trong lần build đầu để tải base image và Go dependencies. Go module pin `go 1.27.0`, toolchain `go1.27.2`.
-- Khuyến nghị: 6 vCPU, 16 GB RAM, SSD còn dung lượng trống. GitLab CE và stack observability khá nặng; máy nhỏ hơn nên tắt bớt service hoặc giảm retention.
-- Minikube + kubectl nếu dùng phần Kubernetes.
-- Tên miền/HTTPS nếu mở public. Mặc định các port chỉ bind loopback.
-
-## 4. Quick start với Docker Compose
+### 4.1 Tools
 
 ```bash
-chmod +x scripts/*.sh
-./scripts/setup.sh
+docker --version
+minikube version
+kubectl version --client
+kustomize version          # optional; kubectl -k works without the standalone binary
+openssl version
+git --version
+curl --version
 ```
 
-`setup.sh` tạo `.env` với secret ngẫu nhiên cho PostgreSQL, role ứng dụng và Grafana, gán `PROJECT_DIR` bằng đường dẫn tuyệt đối và đặt permission `0600`. Script PostgreSQL init tạo role ứng dụng không có `SUPERUSER`/`CREATEDB`/`CREATEROLE` và một database riêng cho integration test.
+- Docker Engine (the default minikube driver) or an equivalent driver.
+- `kubectl`, `minikube`, `openssl`, `git`, `curl`.
+- `python3` for the CRUD helper script and for inspecting Prometheus targets.
+- Internet access to pull `postgres:18`, `nam2107/portfolio:<tag>`, and the observability images.
 
-Kiểm tra `.env` trước khi chạy:
+### 4.2 Cluster sizing
 
 ```bash
-nano .env
-# Kiểm tra PROJECT_DIR, POSTGRES_USER/DB, ALLOWED_HOSTS,
-# PUBLIC_BASE_URL, COOKIE_SECURE, các host port và DOCKER_GID.
+# app + observability (recommended)
+minikube start --cpus=4 --memory=6144 --disk-size=20g
+
+# app only
+minikube start --cpus=2 --memory=4096 --disk-size=15g
 ```
 
-Các lưu ý:
-
-- `POSTGRES_PASSWORD` chỉ dùng cho bootstrap/health check; app dùng `APP_DB_*`.
-- `/docker-entrypoint-initdb.d` chỉ chạy ở lần khởi tạo PostgreSQL đầu tiên. Nếu đã có volume cũ, cần provisioning role/migration thủ công hoặc dùng volume mới (xóa volume sẽ xóa dữ liệu).
-- Nếu dùng Alertmanager/Telegram, tạo file `secrets/telegram_bot_token` (quyền hạn chế) hoặc bỏ mount này trong `compose.yaml` nếu không dùng. Không commit token vào Git.
-- `go.sum` đã có trong repo. Chỉ chạy `go mod tidy` khi thay đổi dependency, sau đó commit cả `go.mod` và `go.sum`.
-
-Khởi động:
+Check the context before doing anything destructive:
 
 ```bash
-./scripts/deploy.sh
-# tương đương:
-# docker compose config
-# docker compose up -d --build
-# docker compose ps
+kubectl config current-context    # must be "minikube"
 ```
 
-Chờ `app1`, `app2`, `app3`, `nginx`, `postgres` và các service observability chuyển sang `healthy`. Lần đầu có thể mất thời gian tải image và build. `app1` chạy migration trước khi serve; `app2`/`app3` chờ `app1` khỏe để tránh tranh migration ban đầu.
+### 4.3 Image availability
 
-Tạo admin đầu tiên (mật khẩu không echo ra terminal):
+The manifests pin `nam2107/portfolio:dc3aef79b8ac`. Verify it exists before deploying:
 
 ```bash
-./scripts/create-admin.sh
+docker manifest inspect nam2107/portfolio:dc3aef79b8ac >/dev/null && echo "image exists"
 ```
 
-Truy cập:
-
-- Website: <http://127.0.0.1:8080>
-- Admin: <http://127.0.0.1:8080/admin/login>
-- Grafana: <http://127.0.0.1:3000>
-- Jenkins: <http://127.0.0.1:8081>
-
-Grafana dùng `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` trong `.env`. Jenkins initial unlock password:
+If you build locally, either push the image to a registry the cluster can pull from, or load it
+into minikube:
 
 ```bash
-docker compose exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+minikube image load nam2107/portfolio:<tag>
 ```
 
-## 5. Cấu hình biến môi trường
+### 4.4 Repository state
 
-| Biến | Mục đích |
-| --- | --- |
-| `PROJECT_DIR` | Đường dẫn tuyệt đối tới thư mục chứa `compose.yaml`; do `setup.sh` thiết lập |
-| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | Database chính và bootstrap administrator của PostgreSQL |
-| `APP_DB_USER`, `APP_DB_PASSWORD` | Role không phải superuser cho app và integration test |
-| `TEST_DB_NAME` | Database riêng cho integration test (mặc định `portfolio_test`) |
-| `APP_IMAGE` | Image Compose sử dụng; mặc định `portfolio-crud:local` |
-| `NGINX_HOST_PORT` / `APP_HOST_PORT` | Host port website; Compose dùng `NGINX_HOST_PORT`, một số script dùng `APP_HOST_PORT` — giữ cả hai là `8080` |
-| `APP1_HOST_PORT`, `APP2_HOST_PORT`, `APP3_HOST_PORT` | Host port debug cho từng instance; mặc định `8081`/`8082`/`8083` |
-| `GRAFANA_HOST_PORT`, `JENKINS_HOST_PORT` | Host port quản trị; mặc định `3000`/`8081` |
-| `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | Tài khoản Grafana |
-| `SESSION_TTL` | Thời hạn session; mặc định `12h` |
-| `COOKIE_SECURE` | Bật `true` sau khi TLS kết thúc tại reverse proxy tin cậy |
-| `PUBLIC_BASE_URL` | Base URL public; đổi sang HTTPS origin khi deploy |
-| `ALLOWED_HOSTS` | Host allowlist của app; thêm hostname thực tế nếu dùng domain |
-| `TRUST_PROXY_HEADERS` | Chỉ bật khi request vào app luôn đi qua reverse proxy tin cậy |
-| `OTEL_TRACES_SAMPLER_ARG` | Sampling ratio 0–1; lab mặc định `1.0` |
-| `DOCKER_GID` | GID của `docker.sock` trên host để Jenkins/agent dùng được Docker daemon |
-| `JENKINS_AGENT_NAME`, `JENKINS_AGENT_SECRET` | Tên node và secret của Jenkins agent |
+- The current working branch in this checkout is `feat/minikube`.
+- The Jenkins pipeline publishes from `main` and Argo CD watches `deploy`.
+- `scripts/argocd-bootstrap.sh` creates `deploy` from `HEAD` if it does not exist.
+- At the time of writing, the remote `deploy` branch had not been pushed. Merge to `main` and run
+  the bootstrap (or run the pipeline once) before expecting Argo CD to reconcile.
 
-Không đưa `.env` lên Git hoặc gắn vào log/bug report. Nếu dùng domain thật, thêm hostname **không kèm port** vào `ALLOWED_HOSTS`.
+---
 
-## 6. CRUD qua giao diện
-
-1. Mở `/admin/login` và đăng nhập.
-2. Tạo project với title, slug duy nhất, summary, description, technologies ngăn cách bằng dấu phẩy, GitHub/demo URL HTTPS và trạng thái.
-3. Upload JPEG hoặc PNG tối đa 5 MiB; file được decode, giới hạn pixel, đặt tên ngẫu nhiên và lưu trên shared volume `uploads_data`.
-4. Chọn `published` để project xuất hiện ở `/projects`; draft không được trả qua public queries.
-5. Sửa project từ danh sách admin; checkbox “Remove thumbnail” để xóa ảnh hiện tại. Xóa project yêu cầu xác nhận trên browser.
-
-Schema dùng UUID, `TEXT[]` cho technologies, unique slug và check constraints cho status/slug/độ dài. Migration nằm trong `migrations/`.
-
-## 7. Observability
-
-### Metrics
-
-Prometheus scrape từng instance (`app1:8080`, `app2:8080`, `app3:8080`) trên `/metrics`; không scrape qua Nginx. Dashboard có request rate, latency histogram, HTTP 5xx/error rate, instance health và Go runtime. Alert rules mẫu theo dõi instance down và 5xx rate cao.
-
-Ví dụ PromQL:
-
-```promql
-sum by (app_instance) (rate(http_server_requests_total[5m]))
-
-histogram_quantile(0.95,
-  sum by (le) (rate(http_server_request_duration_seconds_bucket[5m]))
-)
-
-sum(rate(http_server_requests_total{status=~"5.."}[5m]))
-/
-clamp_min(sum(rate(http_server_requests_total[5m])), 0.001)
-```
-
-### Logs
-
-Go ghi JSON ra stdout/stderr. Alloy tail Docker JSON log files ở `/var/lib/docker/containers` bằng read-only mount, parse envelope và JSON fields, rồi gửi đến Loki. Không mount Docker socket vào Alloy; collector cần quyền đọc host Docker log files. Labels cố ý không dùng request ID/trace ID để tránh cardinality cao.
-
-LogQL mẫu:
-
-```logql
-{service="portfolio-app"}
-{service="portfolio-app", level="ERROR"}
-{service="portfolio-app"} | json | status >= 500
-```
-
-### Traces
-
-Go HTTP instrumentation và spans ở repository tạo trace/span. SDK gửi OTLP gRPC tới `otel-collector:4317`; Collector forward tới Tempo. Với sampling ratio `1.0` ở lab, có thể quan sát từng request. Trong Grafana chọn Tempo → Search, hoặc tra `trace_id` trong JSON log của Loki để đối chiếu.
-
-Sau khi app chạy, tạo traffic rồi kiểm chứng:
+## 5. Quick start
 
 ```bash
-./scripts/verify-observability.sh
-```
+# 1. Create the cluster (once; skip if it already exists)
+minikube start --cpus=4 --memory=6144 --disk-size=20g
+kubectl config current-context        # "minikube"
 
-Script kiểm tra Prometheus có `up=1` cho cả ba instance, Grafana có đủ datasource, Loki có log app và Tempo có trace. Nếu Tempo chưa có trace ở lần đầu, tạo thêm traffic, chờ export rồi chạy lại; đồng thời xem log của app/collector.
-
-## 8. Kiểm thử
-
-```bash
-# Format, vet, unit test, race và coverage
-./scripts/test.sh
-
-# Integration test với PostgreSQL thật (cần .env và Docker)
-./scripts/integration-test.sh
-
-# Smoke test website + load balancing khi Compose đang chạy
-./scripts/smoke.sh
-
-# Acceptance: service status + smoke + observability
-./scripts/acceptance.sh
-
-# CRUD end-to-end qua HTTP, cần tài khoản admin
-./scripts/curl-crud.sh
-```
-
-Ghi chú:
-
-- `tests/integration` sẽ skip nếu không có `TEST_DATABASE_URL`. `integration-test.sh` tự tạo container Go tạm và dùng database `TEST_DB_NAME`; không chạy test này trên database chứa dữ liệu cần giữ.
-- `smoke.sh` gửi 30 request và xác nhận thấy đủ header `X-App-Instance: app1`, `app2`, `app3`.
-- Kiểm tra failover thủ công:
-
-```bash
-docker compose stop app2
-for i in $(seq 1 10); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null || exit 1; done
-# 10 request vẫn thành công trong lúc app2 dừng.
-docker compose start app2
-./scripts/smoke.sh
-```
-
-- Compose project name là `portfolio`, nên network có dạng `portfolio_db_net` / `portfolio_obs_net`. Nếu script báo không tìm thấy network, đặt `DB_NETWORK=portfolio_db_net` hoặc cập nhật tên network tương ứng trong script.
-
-## 9. Kubernetes / minikube
-
-### 9.1. Bootstrap thủ công (fallback)
-
-Dùng khi chưa cài Argo CD hoặc cần dựng lại cluster:
-
-```bash
-# App + PostgreSQL trong namespace portfolio
+# 2. Deploy the app + PostgreSQL
+chmod +x scripts/k8s-*.sh
 ./scripts/k8s-deploy.sh
 
-# Prometheus, Grafana, Loki, Tempo, OTel Collector, Alloy, cAdvisor
-./scripts/k8s-monitoring-deploy.sh
+# 3. Add host entries
+echo "$(minikube ip) portfolio.local" | sudo tee -a /etc/hosts
 
-# Thêm host entry (một lần)
-MINIKUBE_IP="$(minikube ip)"
-printf '%s portfolio.local\n%s grafana.local\n%s argocd.local\n' \
-  "$MINIKUBE_IP" "$MINIKUBE_IP" "$MINIKUBE_IP" | sudo tee -a /etc/hosts
+# 4. Verify
+curl -i http://portfolio.local/healthz
+curl -i http://portfolio.local/readyz
+curl -i http://portfolio.local/projects
 ```
 
-Truy cập:
+Open <http://portfolio.local>.
 
-- App: <http://portfolio.local>
-- Grafana: <http://grafana.local>
-- Argo CD: <http://argocd.local> (sau khi bootstrap Argo CD)
+Add observability:
 
-Tạo admin trong cluster:
+```bash
+./scripts/k8s-monitoring-deploy.sh
+echo "$(minikube ip) grafana.local portfolio.local" | sudo tee -a /etc/hosts
+```
+
+Add GitOps:
+
+```bash
+./scripts/argocd-bootstrap.sh
+echo "$(minikube ip) argocd.local" | sudo tee -a /etc/hosts
+```
+
+**Recommended order: app → observability → Argo CD.** `argocd-bootstrap.sh` adopts workloads that
+already exist; after Argo CD owns the namespaces, use Git for changes and reserve `kubectl apply -k`
+for bootstrap/emergency use.
+
+Create the first admin:
 
 ```bash
 ./scripts/k8s-create-admin.sh
 ```
 
-Smoke test qua ingress (dùng IP + Host header, không cần `/etc/hosts`):
+Then sign in at <http://portfolio.local/admin/login>.
+
+---
+
+## 6. Repository layout
+
+```text
+cmd/server/                  entrypoint: start | migrate | create-admin | serve | healthcheck
+internal/
+  auth/                      Argon2id hashing, opaque sessions
+  config/                    environment parsing and validation
+  handler/                   chi routes, HTML rendering, admin CRUD
+  middleware/                host allowlist, CSRF, session, headers, rate limit
+  model/                     project model
+  observability/             Prometheus metrics, OTLP tracing
+  repository/                PostgreSQL queries
+  service/                   project business logic
+  storage/                   local thumbnail storage
+migrations/                  versioned SQL migrations
+web/                         html/template files + static assets
+tests/integration/           PostgreSQL integration test
+deploy/
+  k8s/                       app + PostgreSQL Kustomize base
+  k8s/observability/         Prometheus/cAdvisor/Loki/Alloy/Tempo/OTel/Grafana
+  argocd/                    pinned Argo CD install + Applications
+  ci/                        Jenkins agent image
+  jenkins/                   Jenkins controller image + plugins
+  postgres/init/             least-privilege role creation
+  nginx/, prometheus/, grafana/, loki/, tempo/, otel-collector/, alloy/, alertmanager/
+scripts/                     setup, deploy, test, k8s, GitOps, Jenkins helpers
+compose.yaml                 local multi-service development stack
+Jenkinsfile                  declarative CI/CD pipeline
+SECURITY.md                  threat assumptions and hardening checklist
+VERIFICATION.md              packaging-time verification report (may be stale)
+```
+
+---
+
+## 7. Application + PostgreSQL on minikube
+
+### 7.1 What the deployment creates
+
+| Resource | Name | Notes |
+| --- | --- | --- |
+| Namespace | `portfolio` | |
+| Secret | `portfolio-db` | Generated by `scripts/k8s-deploy.sh`, not in Git |
+| ConfigMap | `postgres-initdb` | Creates the `portfolio_app` role on first init |
+| StatefulSet | `postgres` | `postgres:18`, 2 Gi PVC, headless Service `postgres:5432` |
+| ConfigMap | `portfolio-app-config` | Non-secret application environment |
+| PVC | `portfolio-uploads` | 1 Gi, `ReadWriteOnce` |
+| Deployment | `portfolio` | 1 replica, `fix-perms` + `migrate` init containers, `serve` app |
+| Service | `portfolio` | ClusterIP `80 → 8080` |
+| Ingress | `portfolio` | Host `portfolio.local`, class `nginx` |
+| Job | `create-admin` | One-shot; applied only by `scripts/k8s-create-admin.sh` |
+
+### 7.2 What `scripts/k8s-deploy.sh` does
+
+1. Verifies `kubectl`, `minikube` and `openssl` exist.
+2. Enables the minikube `ingress` addon (no-op if already enabled).
+3. Waits for `deployment/ingress-nginx-controller` to roll out.
+4. Creates the `portfolio` namespace.
+5. Reuses `portfolio-db` if it exists; otherwise generates random hex passwords and creates it.
+6. Applies `deploy/k8s` with Kustomize.
+7. Waits for the PostgreSQL StatefulSet and the app Deployment.
+8. Prints pods, services, ingress and next steps.
+
+Re-running the script is safe: it reuses the database secret rather than rotating credentials.
+
+### 7.3 Manual deployment (equivalent)
 
 ```bash
+minikube addons enable ingress
+kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=300s
+
+kubectl apply -f deploy/k8s/namespace.yaml
+
+POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+APP_DB_PASSWORD="$(openssl rand -hex 24)"
+DATABASE_URL="postgres://portfolio_app:${APP_DB_PASSWORD}@postgres:5432/portfolio?sslmode=disable"
+
+kubectl -n portfolio create secret generic portfolio-db \
+  --from-literal=POSTGRES_DB=portfolio \
+  --from-literal=POSTGRES_USER=portfolio_admin \
+  --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+  --from-literal=APP_DB_USER=portfolio_app \
+  --from-literal=APP_DB_PASSWORD="$APP_DB_PASSWORD" \
+  --from-literal=DATABASE_URL="$DATABASE_URL"
+
+kubectl apply -k deploy/k8s
+kubectl -n portfolio rollout status statefulset/postgres --timeout=300s
+kubectl -n portfolio rollout status deployment/portfolio --timeout=300s
+```
+
+The secret contains:
+
+| Key | Used by | Purpose |
+| --- | --- | --- |
+| `POSTGRES_DB` | PostgreSQL | Database name |
+| `POSTGRES_USER` | PostgreSQL | Bootstrap superuser (not used by the app) |
+| `POSTGRES_PASSWORD` | PostgreSQL | Bootstrap superuser password |
+| `APP_DB_USER` | init script + app | Least-privilege runtime role (`portfolio_app`) |
+| `APP_DB_PASSWORD` | init script + app | Runtime role password |
+| `DATABASE_URL` | app + migrations | Full connection URL used by the Go binary |
+
+### 7.4 Database privilege model
+
+`deploy/k8s/postgres/configmap-initdb.yaml` runs only when PostgreSQL initializes an empty data
+directory. It creates `portfolio_app` with:
+
+- `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`
+- `CONNECT`, `TEMPORARY` on the database
+- `USAGE`, `CREATE` on schema `public` (needed for migrations)
+
+The app never uses `portfolio_admin`. This matters when rotating credentials: **changing the secret
+after the first start does not change the existing database role.** Reset the database or alter the
+role manually (see [Rotate database credentials](#113-rotate-database-credentials)).
+
+### 7.5 Pod lifecycle and probes
+
+App pod init containers, in order:
+
+1. **`fix-perms`** — runs as root, mounts the uploads PVC, creates `/app/uploads`, chowns it to
+   `65532:65532`, sets mode `0750`. This is required because hostPath/local PVCs may not honour
+   `fsGroup`.
+2. **`migrate`** — runs the app image with `args: ["migrate"]`, using the same config and DB secret.
+   Applies pending SQL migrations before the server starts.
+
+Main container:
+
+- `args: ["serve"]` — does **not** run migrations; it only serves.
+- `APP_INSTANCE` is injected from `metadata.name` (useful when scaling).
+- Startup probe: `exec /app/portfolio healthcheck`, every 5s, 40 failures (~200s budget).
+- Readiness probe: same exec check, every 5s, 3 failures (checks DB through `/readyz`).
+- Liveness probe: TCP on port `http`, every 10s, 3 failures. It deliberately does **not** check the
+  database, so a DB blip does not restart every app pod.
+- `terminationGracePeriodSeconds: 40`.
+- Rolling update: `maxUnavailable: 0`, `maxSurge: 1`.
+
+Exec probes are used instead of HTTP probes because the app's host allowlist would reject the
+kubelet's Pod-IP `Host` header. The built-in `healthcheck` calls `127.0.0.1`, which is allowed.
+
+### 7.6 Verify the deployment
+
+```bash
+kubectl -n portfolio get pods,pvc,svc,ingress
+kubectl -n portfolio get pods -o wide
+kubectl -n portfolio logs statefulset/postgres --tail=50
+kubectl -n portfolio logs deployment/portfolio --tail=50
+kubectl -n portfolio logs deployment/portfolio -c migrate --tail=50
+```
+
+HTTP checks:
+
+```bash
+curl -i http://portfolio.local/healthz     # 200 "ok"
+curl -i http://portfolio.local/readyz      # 200 "ready" (checks DB)
+curl -i http://portfolio.local/projects    # 200
+curl -i http://portfolio.local/            # 200
+```
+
+Bypass `/etc/hosts` by sending the Host header explicitly:
+
+```bash
+curl -i -H 'Host: portfolio.local' "http://$(minikube ip)/healthz"
 SMOKE_HOST="$(minikube ip)" ./scripts/k8s-smoke.sh
 ```
 
-### 9.2. Argo CD sở hữu cluster
+`scripts/k8s-smoke.sh` checks `/healthz`, `/readyz`, `/projects` and `/`. It is safe to run from a
+container because it takes `SMOKE_HOST`/`BASE_URL` and sends `Host: portfolio.local`.
 
-Sau khi `./scripts/argocd-bootstrap.sh` chạy, **Argo CD là nguồn triển khai chính** cho namespace `portfolio` và `observability`. `kubectl apply -k` / `kubectl set image` chỉ dùng để bootstrap hoặc xử lý sự cố; Argo CD sẽ revert drift ở lần sync tiếp theo.
+> Do **not** use `scripts/smoke.sh` for Kubernetes. It asserts it can observe the Compose
+> instances `app1`, `app2`, `app3` through the Nginx load balancer.
 
-- Image tag nằm ở `deploy/k8s/kustomization.yaml` (`images:`), không sửa trực tiếp `deployment.yaml`.
-- `create-admin` Job không nằm trong kustomization; `scripts/k8s-create-admin.sh` tự lấy tag từ kustomization để không lệch image.
-- Secret `portfolio-db` và `grafana-admin` do `scripts/k8s-deploy.sh` / `scripts/k8s-monitoring-deploy.sh` tạo, **không** nằm trong Git. Không đưa secret vào Git nếu chưa có secret manager.
-
-Teardown (xóa dữ liệu):
+### 7.7 Create the first admin
 
 ```bash
-./scripts/k8s-teardown.sh app          # namespace portfolio
-./scripts/k8s-teardown.sh monitoring   # namespace observability + RBAC Alloy
-./scripts/k8s-teardown.sh all
+./scripts/k8s-create-admin.sh
 ```
 
-Thêm `--disable-ingress` nếu muốn tắt ingress addon.
+The script:
 
-## 10. CI/CD: GitHub → Jenkins → Docker Hub → Argo CD
+1. Resolves the image tag from `kubectl kustomize deploy/k8s` (the Job is not part of the
+   Kustomization on purpose, so Argo CD will not auto-apply it).
+2. Prompts for a username (3–80 chars) and password (at least 12 chars, entered twice).
+3. Creates a temporary `portfolio-admin` secret.
+4. Applies `deploy/k8s/jobs/create-admin-job.yaml` with the resolved image.
+5. Waits for Job completion, prints logs, deletes the Job and the temporary secret.
 
-### 10.1. Branch model
+Sign in at <http://portfolio.local/admin/login>.
 
-- `main` là branch phát triển. CI chạy trên mọi lần push/PR.
-- `deploy` là branch do `scripts/ci-gitops-bump.sh` tạo/cập nhật: mirror thư mục `deploy/` từ commit build và chỉ khác image tag.
-- **Không sửa tay branch `deploy`.** Argo CD watch branch này; lần pipeline tiếp theo sẽ ghi đè từ `main`.
-- Repo public nên Argo CD không cần credential đọc. Nếu chuyển private, thêm deploy key/HTTPS credential trong **Settings → Repositories** của Argo CD.
-
-### 10.2. Cài đặt một lần
+### 7.8 CRUD acceptance check
 
 ```bash
-# 1. Jenkins controller + agent.
-#    Trong Jenkins: Manage Jenkins -> Nodes -> New node
-#      name: ci-agent, label: docker-go, remote root: /home/jenkins/agent
-#    Copy secret vào .env (JENKINS_AGENT_SECRET), rồi:
-./scripts/deploy_jenkins.sh
+BASE_URL=http://portfolio.local ./scripts/curl-crud.sh
+```
 
-# 2. Argo CD + hai Application (tự tạo branch deploy nếu chưa có)
+This logs in with CSRF handling, creates a project, verifies it in the admin list and public detail
+page, updates it, deletes it, and confirms the public page returns 404. It requires `python3`.
+
+### 7.9 Scaling the app
+
+The uploads PVC is `ReadWriteOnce`. On single-node minikube, multiple replicas can still mount it,
+but start with one replica:
+
+```bash
+kubectl -n portfolio scale deployment/portfolio --replicas=3
+kubectl -n portfolio rollout status deployment/portfolio --timeout=300s
+```
+
+Notes:
+
+- The app stores sessions in PostgreSQL, so any replica can validate a session.
+- Uploaded files are on a shared PVC, so all replicas see the same thumbnails.
+- Rate limiting is in-memory per pod; with three replicas the effective limit triples.
+- `maxUnavailable: 0` keeps the rollout available.
+
+### 7.10 Application configuration reference
+
+`deploy/k8s/app/configmap.yaml`:
+
+| Variable | Default in k8s | Meaning |
+| --- | --- | --- |
+| `PORT` | `8080` | HTTP listen port |
+| `SESSION_TTL` | `12h` | Session lifetime |
+| `COOKIE_SECURE` | `false` | Set `true` only after TLS termination |
+| `PUBLIC_BASE_URL` | `http://portfolio.local` | Used for absolute URLs/redirects |
+| `TRUST_PROXY_HEADERS` | `true` | Trust `X-Real-IP` from the ingress |
+| `ALLOWED_HOSTS` | `portfolio.local,localhost,127.0.0.1,portfolio.portfolio.svc.cluster.local` | Host header allowlist |
+| `UPLOAD_DIR` | `/app/uploads` | Thumbnail storage |
+| `MAX_UPLOAD_BYTES` | `5242880` | 5 MiB application-level limit |
+| `TEMPLATE_DIR` | `/app/web/templates` | HTML templates |
+| `STATIC_DIR` | `/app/web/static` | Static assets |
+| `MIGRATIONS_DIR` | `/app/migrations` | SQL migrations |
+| `OTEL_SERVICE_NAME` | `portfolio-app` | Trace service name |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector.observability.svc.cluster.local:4317` | OTLP gRPC |
+| `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Sampling ratio |
+
+`APP_INSTANCE` is added from the pod name via `fieldRef`; it appears in logs and the
+`X-App-Instance` response header.
+
+---
+
+## 8. Observability stack
+
+### 8.1 Components
+
+| Component | Image | Role |
+| --- | --- | --- |
+| `prometheus` | `prom/prometheus:v3.15.1` | Scrapes `/metrics`, evaluates alert rules, 24h retention |
+| `cadvisor` | `gcr.io/cadvisor/cadvisor:v0.55.1` | Container CPU/memory/network/filesystem metrics (DaemonSet, privileged) |
+| `loki` | `grafana/loki:3.7.9` | Log storage, 7-day (168h) retention |
+| `alloy` | `grafana/alloy:v1.21.3` | Tails pod logs through the Kubernetes API and pushes to Loki |
+| `tempo` | `grafana/tempo:3.1.1` | Trace storage on a local PVC |
+| `otel-collector` | `otel/opentelemetry-collector-contrib:0.164.0` | OTLP gRPC/HTTP receiver, forwards traces to Tempo |
+| `grafana` | `grafana/grafana:13.2.5` | Dashboards and Explore, provisioned datasources |
+
+### 8.2 Data flow
+
+```mermaid
+flowchart LR
+  APP[portfolio app] -- /metrics --> P[Prometheus]
+  CAD[cAdvisor] -- /metrics --> P
+  APP -- OTLP gRPC 4317 --> OC[OTel Collector]
+  OC -- OTLP 4317 --> T[Tempo]
+  APP -- JSON stdout --> AL[Alloy]
+  AL --> L[Loki]
+  G[Grafana] --> P
+  G --> L
+  G --> T
+```
+
+Details:
+
+- **Metrics:** the app exposes `http_server_requests_total`, `http_server_request_duration_seconds`,
+  Go runtime and process metrics. Prometheus scrapes the in-cluster Service host
+  `portfolio.portfolio.svc.cluster.local:80`. That hostname is in `ALLOWED_HOSTS`; without it the
+  app returns HTTP 421 and the target shows DOWN.
+- **Logs:** the app writes one JSON object per line to stdout. Alloy discovers pods in the
+  `portfolio` namespace via the Kubernetes API, parses JSON, and promotes only `level` and
+  `service` to Loki labels to keep cardinality bounded. `trace_id`, `request_id`, `instance` remain
+  in the log line (filter with `| json`).
+- **Traces:** the app uses OTLP gRPC with a 2s batch timeout. The collector applies a 128 MiB memory
+  limiter and a 512-span batch, then forwards to Tempo. Tempo stores blocks and WAL on a PVC.
+
+### 8.3 Deploy
+
+```bash
+./scripts/k8s-monitoring-deploy.sh
+echo "$(minikube ip) grafana.local portfolio.local" | sudo tee -a /etc/hosts
+```
+
+The script:
+
+1. Creates the `observability` namespace.
+2. Reuses `grafana-admin` if present; otherwise generates an admin password.
+3. Enables the ingress addon if `ingress-nginx` is missing and waits for the controller.
+4. Applies `deploy/k8s/observability`.
+5. If the `portfolio` namespace exists, re-applies `deploy/k8s` to refresh the OTLP endpoint and
+   scrape host, then restarts the app.
+6. Waits for Prometheus, Loki, Tempo, OTel Collector, Grafana, cAdvisor and Alloy.
+7. Prints Grafana credentials and access instructions.
+
+### 8.4 Grafana access and credential behavior
+
+```bash
+kubectl -n observability get secret grafana-admin \
+  -o jsonpath='{.data.admin-user}'; echo
+kubectl -n observability get secret grafana-admin \
+  -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+
+Open <http://grafana.local>.
+
+> `GF_SECURITY_ADMIN_PASSWORD` is only applied when Grafana initializes its database. Changing the
+> secret later does not change the existing login. Reset it explicitly:
+>
+> ```bash
+> kubectl -n observability exec deploy/grafana -- \
+>   grafana cli admin reset-admin-password 'new-password'
+> ```
+
+Grafana 13 registers bundled plugins on startup and can take **1–5 minutes** on a small node. The
+manifest uses a 5-minute `startupProbe` (60 × 10s) so liveness does not kill it mid-boot.
+
+### 8.5 Verify metrics
+
+```bash
+kubectl -n observability get pods,pvc,svc,ingress
+kubectl -n observability get pods --field-selector=status.phase!=Running
+```
+
+Prometheus targets:
+
+```bash
+kubectl -n observability port-forward svc/prometheus 9090:9090 >/dev/null &
+curl -s http://127.0.0.1:9090/api/v1/targets | python3 -c '
+import json,sys
+for t in json.load(sys.stdin)["data"]["activeTargets"]:
+    print(f"{t[\"labels\"][\"job\"]:16} {t[\"health\"]:8} {t.get(\"lastError\",\"\")}")
+'
+```
+
+Expected jobs: `prometheus`, `portfolio-app`, `cadvisor`, `loki`, `tempo`, `otel-collector`.
+
+Check the app's own metrics endpoint:
+
+```bash
+kubectl -n portfolio port-forward svc/portfolio 8080:80 >/dev/null &
+curl -s http://127.0.0.1:8080/metrics | head
+```
+
+Generate traffic so all three signals have data:
+
+```bash
+for i in $(seq 1 30); do curl -fsS -o /dev/null http://portfolio.local/projects; done
+```
+
+### 8.6 Dashboards, logs and traces
+
+In Grafana:
+
+- **Dashboards → Portfolio**
+  - `Portfolio Service Overview`
+  - `Portfolio - cAdvisor / Containers`
+  - `Portfolio - Node Exporter / Host` — **stays empty** in Kubernetes because node-exporter is not
+    deployed there (it exists only in Compose).
+- **Explore → Loki**
+  - `{service="portfolio-app"}` or `{namespace="portfolio"}`
+  - Add `| json` to filter on fields such as `trace_id`, `request_id`, `status`, `duration_ms`.
+- **Explore → Tempo**
+  - Query type **Search**, service name `portfolio-app`.
+  - Open a trace; the "Logs for this span" link uses the Loki datasource.
+  - Loki has a derived field that turns a 32-hex `trace_id` in a log line into a "View trace" link.
+
+Without Grafana:
+
+```bash
+kubectl -n observability port-forward svc/loki 3100:3100 >/dev/null &
+curl -s http://127.0.0.1:3100/loki/api/v1/labels
+
+kubectl -n observability port-forward svc/tempo 3200:3200 >/dev/null &
+curl -s 'http://127.0.0.1:3200/api/search?tags=service.name%3Dportfolio-app' | head -c 500
+```
+
+### 8.7 Alerting behavior in Kubernetes
+
+Kubernetes uses `deploy/k8s/observability/config/alert.rules.yml`, which contains:
+
+| Alert | Expression | For |
+| --- | --- | --- |
+| `PrometheusTargetDown` | `up == 0` | 2m |
+| `PortfolioAppDown` | `up{job="portfolio-app"} == 0` | 1m |
+| `ContainerHighMemory` | container working set / limit > 85% | 10m |
+
+**There is no Alertmanager in the Kubernetes stack.** Alerts appear in the Prometheus UI under
+Alerts, but no notifications are delivered. If you need delivery, add Alertmanager and a receiver,
+and keep credentials in a Secret. The Compose stack includes Alertmanager + node-exporter, but its
+Telegram receiver currently contains a hardcoded bot token — see [Security notes](#14-security-notes).
+
+### 8.8 Retention and footprint
+
+- Prometheus retention: `24h`.
+- Loki retention: `168h` with filesystem storage and compactor.
+- Tempo: local filesystem blocks/WAL; retention is not explicitly configured, so growth is bounded
+  by the 2 Gi PVC.
+- Grafana: 1 Gi PVC for its SQLite database and plugins.
+- cAdvisor and Alloy have no PVC; Alloy uses a 512 Mi `emptyDir` for its storage path.
+- Total observability requests are roughly `450m` CPU / `960Mi`; limits roughly `2.7` cores /
+  `2.1Gi`. Grafana is the hungriest at boot.
+
+### 8.9 Changing observability configuration
+
+ConfigMaps are generated from `deploy/k8s/observability/config/` with fixed names. A config-only
+change does not automatically roll the pod, so restart explicitly:
+
+```bash
+$EDITOR deploy/k8s/observability/config/prometheus.yml   # or loki.yml, tempo.yml, alloy.alloy, ...
+kubectl apply -k deploy/k8s/observability
+kubectl -n observability rollout restart deployment/prometheus
+# loki / tempo / otel-collector / grafana the same way
+```
+
+Dashboards live in `config/dashboards/`. Grafana polls the file provider, so they usually appear
+within about 30 seconds after `kubectl apply -k` without a restart. Datasource changes require a
+Grafana restart.
+
+### 8.10 Application instrumentation details
+
+- Metrics use a dedicated Prometheus registry and expose custom HTTP counters/histograms plus Go
+  runtime and process collectors.
+- HTTP metrics record method, chi route pattern, status and duration. `/metrics` itself is skipped
+  to avoid self-noise.
+- The logging middleware emits `service`, `instance`, `request_id`, `trace_id`, `method`, `route`,
+  `status`, `duration_ms` and `response_bytes`.
+- Tracing uses a parent-based ratio sampler configured by `OTEL_TRACES_SAMPLER_ARG`; the service
+  instance ID is the pod name.
+- OTLP export is batched every 2 seconds. The app can start without a collector; export attempts
+  log warnings until the collector is reachable.
+
+---
+
+## 9. Argo CD and GitOps
+
+### 9.1 Bootstrap
+
+```bash
 ./scripts/argocd-bootstrap.sh
-
-# 3. Host entry cho Argo UI
 echo "$(minikube ip) argocd.local" | sudo tee -a /etc/hosts
 ```
 
-Chi tiết agent: [`deploy/ci/README.md`](deploy/ci/README.md). Chi tiết Argo CD: [`deploy/argocd/README.md`](deploy/argocd/README.md).
+The script:
 
-Trước khi bootstrap Argo CD, hãy commit thay đổi. `argocd-bootstrap.sh` tạo branch `deploy` từ `HEAD` và **không** bao gồm thay đổi chưa commit.
+1. Warns if the current kubectl context is not `minikube` and asks for confirmation.
+2. Creates the `deploy` branch from `HEAD` if it does not exist on the remote.
+3. Installs Argo CD with `kubectl apply --server-side -k deploy/argocd` (server-side apply avoids
+   the 256 KiB annotation limit on the large CRDs).
+4. Waits for `argocd-server`, `argocd-repo-server` and the application controller.
+5. Registers the two Applications from `deploy/argocd/apps`.
 
-### 10.3. Jenkins Credentials
+Argo CD is pinned to **v3.6.1** in `deploy/argocd/install.yaml`. The Kustomization patches
+`timeout.reconciliation: 60s` and `server.insecure: "true"` (TLS terminated at the ingress).
 
-| ID | Loại | Nội dung |
-| --- | --- | --- |
-| `dockerhub` | Username/password | Docker Hub username + access token (scope tối thiểu) |
-| `github-gitops` | Secret text | GitHub PAT chỉ có quyền push branch `deploy` |
-| `argocd-admin-password` | Secret text | Password admin Argo CD (chỉ dùng để `argocd app wait`) |
-
-Không commit token vào repository. Token Docker Hub từng nằm trong `.gitlab-ci.yml` cũ đã bị xóa; token đó phải được **revoke** trên Docker Hub. Tương tự, không đặt bot token/chat ID trực tiếp trong file cấu hình Alertmanager; dùng secret và thu hồi token nếu từng bị commit.
-
-### 10.4. GitHub webhook qua ngrok
+Initial admin password:
 
 ```bash
-ngrok http 8081 --domain=<reserved>.ngrok-free.app --basic-auth=<user>:<pass>
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d; echo
 ```
 
-- Đặt Jenkins URL thành `https://<reserved>.ngrok-free.app`.
-- GitHub → Settings → Webhooks:
-  - URL: `https://<reserved>.ngrok-free.app/github-webhook/`
-  - Nếu bật `--basic-auth`, dùng `https://<user>:<pass>@<reserved>.ngrok-free.app/github-webhook/`.
-  - Content type: `application/json`
-  - Secret: trùng với Jenkins
-  - Events: `push` và `pull_request`
-- Tạo **Multibranch Pipeline** trỏ tới repository.
-
-**Cảnh báo:** Jenkins mount `/var/run/docker.sock`, gần tương đương quyền root trên host. ngrok mở toàn bộ UI Jenkins ra Internet. Bắt buộc bật basic auth, mật khẩu admin mạnh, webhook secret, tắt anonymous access; tốt hơn là đặt reverse proxy chỉ cho `/github-webhook/` hoặc dùng Cloudflare Tunnel + Access. Không expose agent port/Jenkins CLI.
-
-### 10.5. Pipeline stages
-
-| Stage | Nội dung |
-| --- | --- |
-| Checkout | `TAG=sha-<12>` |
-| Format & vet | `gofmt`, `go vet` |
-| Unit tests | `gotestsum`, race, coverage, JUnit |
-| Database integration | PostgreSQL 18 tạm + `tests/integration` |
-| Dependency scan | `govulncheck` |
-| Build | `docker build --pull` |
-| Image scan | Trivy: fail ở `CRITICAL`, báo cáo `HIGH` |
-| Publish | Chỉ `main`; push `nam2107/portfolio:$TAG` |
-| GitOps bump | Copy `deploy/` sang branch `deploy`, `kustomize edit set image` |
-| Wait for Argo | `argocd app wait` cho app và monitoring |
-| Smoke | `scripts/k8s-smoke.sh` qua ingress |
-
-PR chỉ chạy CI. Publish/GitOps/deploy chỉ chạy trên `main`. Pipeline dùng `disableConcurrentBuilds()` để tránh hai lần bump chồng nhau.
-
-### 10.6. Rollback và lưu ý vận hành
+Open <http://argocd.local> and sign in as `admin`, or use the CLI:
 
 ```bash
-# Xem lịch sử và rollback qua Argo CD
+argocd login argocd.local --plaintext --grpc-web
+argocd app list
+argocd app get portfolio-app
+```
+
+Change the admin password immediately after first login. The pipeline uses it only to wait for sync;
+for anything beyond a homelab, create a least-privilege API token instead.
+
+### 9.2 Applications
+
+| Application | Path | Destination namespace | Sync policy |
+| --- | --- | --- | --- |
+| `portfolio-app` | `deploy/k8s` | `portfolio` | automated, prune, self-heal |
+| `portfolio-observability` | `deploy/k8s/observability` | `observability` | automated, prune, self-heal |
+
+Both track `targetRevision: deploy` of `https://github.com/zetasuna/portfolio.git`. Argo CD polls
+the branch every 60 seconds. `CreateNamespace=true` is set, with retry (5 attempts, exponential
+backoff up to 5 minutes).
+
+### 9.3 Branch model
+
+- **`main`** — developer branch. CI runs here. Image publish, GitOps bump, Argo wait and smoke only
+  run on `main`.
+- **`deploy`** — generated by `scripts/ci-gitops-bump.sh`. It mirrors `deploy/` from the build
+  commit and differs only by the image tag in `deploy/k8s/kustomization.yaml`.
+- **Never edit `deploy` by hand.** The next pipeline run overwrites it from `main`.
+- Argo CD must not watch `main`, otherwise the tag bump would trigger CI again.
+
+The repository is public, so Argo CD needs no repository credentials. If it becomes private, add a
+deploy key or HTTPS credential under **Settings → Repositories**.
+
+### 9.4 First sync and adopting existing workloads
+
+If you deployed the app/observability manually before installing Argo CD, the first sync adds
+tracking metadata to existing resources. It does not recreate Deployments, StatefulSets, PVCs or
+ConfigMaps.
+
+```bash
+argocd login argocd.local --plaintext --grpc-web
+argocd app get portfolio-app
+argocd app get portfolio-observability
+argocd app diff portfolio-app
+argocd app diff portfolio-observability
+
+kubectl -n portfolio get deploy,sts,pvc
+kubectl -n observability get deploy,ds,pvc
+```
+
+`portfolio-db` and `grafana-admin` are created by scripts and are **not in Git**, so Argo CD does not
+manage or prune them.
+
+> `portfolio-observability` may report `Degraded` while the Alloy DaemonSet is not ready. That is a
+> workload health issue, not a sync failure. Check Alloy readiness/logs before treating Argo health
+> as a deploy gate.
+
+### 9.5 Drift and self-heal
+
+After bootstrap, `kubectl apply -k` and `kubectl set image` are bootstrap/emergency tools only.
+Argo CD's `selfHeal` reverts drift on the next reconciliation. If you need a permanent change, commit
+it to `main` and let the pipeline regenerate `deploy`.
+
+### 9.6 Rollback
+
+```bash
 argocd app history portfolio-app
 argocd app rollback portfolio-app <history-id>
 
-# Hoặc revert commit tag trên branch deploy
+# Or revert the GitOps commit on the deploy branch
 git revert <gitops-commit>
 ```
 
-- Docker Hub token chỉ có scope cần thiết; không dùng mật khẩu tài khoản chính.
-- Trivy có thể báo false positive; nếu chấp nhận rủi ro phải ghi lại quyết định, không tắt gate im lặng.
-- Rollback image **không** rollback database migration. Migration phải tương thích ngược; migration phá hủy cần quy trình riêng.
-- `create-admin` Job chạy một lần, không nằm trong kustomization.
-- Alloy hiện có thể chưa ready, khiến Application `portfolio-observability` báo `Degraded`; đây là lỗi workload có sẵn, không phải lỗi sync. Kiểm tra readiness probe/log của DaemonSet Alloy trước khi dùng Argo health làm deploy gate.
+Image rollback does **not** roll back database migrations. Migrations must be backward-compatible;
+destructive migrations need a separate, reviewed procedure.
 
-## 11. HTTPS / triển khai ngoài localhost
+### 9.7 Upgrading Argo CD
 
-Compose mặc định chỉ bind loopback. Để dùng public domain, nên đặt một TLS reverse proxy ở trước host/edge network, cấu hình HTTPS/HSTS sau khi TLS được kiểm chứng, đặt `COOKIE_SECURE=true`, đổi `PUBLIC_BASE_URL=https://your-domain`, thêm domain vào `ALLOWED_HOSTS`, giới hạn firewall và chỉ expose cổng 80/443. Jenkins/Grafana vẫn nên truy cập qua VPN hoặc mạng quản trị.
+1. Replace `deploy/argocd/install.yaml` with the manifest from the new release.
+2. Update the pinned version in `deploy/argocd/README.md`.
+3. Apply:
 
-Không dùng `TRUST_PROXY_HEADERS=true` khi app có thể bị truy cập trực tiếp bởi client không tin cậy; rate limit lấy client IP từ `X-Real-IP` khi bật trust proxy. Đảm bảo proxy ghi đè header thay vì chuyển tiếp giá trị client tùy ý.
-
-## 12. Backup, retention và sizing
-
-Named volume giữ dữ liệu qua việc recreate container, **không phải backup**. Backup tối thiểu:
-
-- PostgreSQL: `pg_dump` định kỳ.
-- `uploads_data`: archive/copy thư mục upload.
-- Minikube: backup PVC của `portfolio` và `observability` nếu dữ liệu quan trọng.
-
-Test restore định kỳ. Không copy dữ liệu khi database đang ghi nếu chưa đảm bảo tính nhất quán.
-
-Retention mặc định trong Compose:
-
-- Prometheus: 7 ngày.
-- Loki: 168 giờ / 7 ngày.
-- Tempo block retention: 48 giờ.
-
-Nếu disk/RAM tăng nhanh, xem `docker stats`, `docker system df`, retention và log size. Mỗi service còn có thể tạo log riêng qua Docker JSON log driver.
-
-## 13. Xử lý lỗi thường gặp
-
-**Compose báo `Set PROJECT_DIR`:** chạy `./scripts/setup.sh` trước, hoặc đảm bảo `.env` có đường dẫn tuyệt đối chính xác.
-
-**Port `8081` đã bị chiếm:** `app1` và Jenkins mặc định cùng dùng `8081`. Đặt `APP1_HOST_PORT=18081` hoặc đổi `JENKINS_HOST_PORT` trong `.env`.
-
-**Ứng dụng không start / `connection refused`:** xem `docker compose logs postgres app1 otel-collector`; xác minh mật khẩu PostgreSQL, readiness, DNS/network, collector và quyền volume.
-
-**Login bị 403:** lấy form mới để nhận CSRF cookie/token; xác nhận browser nhận cookie; nếu HTTPS thì chỉ bật `COOKIE_SECURE=true` sau khi TLS proxy cấu hình đúng.
-
-**Host bị từ chối:** thêm hostname không kèm port vào `ALLOWED_HOSTS`, sửa `PUBLIC_BASE_URL` và kiểm tra header `Host` qua Nginx.
-
-**Image upload không lưu:** xem `docker compose logs app1`; xác minh shared `uploads_data`, quyền filesystem non-root và file thực sự là JPEG/PNG (SVG/WebP hiện không nhận).
-
-**Prometheus target down:** kiểm tra `docker compose ps`, app health, `deploy/prometheus/prometheus.yml` và DNS tới từng app.
-
-**Loki không thấy logs:** xem log Alloy; trên Linux xác minh Docker dùng `json-file` logging driver và log files host đọc được. Alloy dùng read-only mount của Docker log path và không hỗ trợ mọi logging driver.
-
-**Tempo trống:** gửi HTTP traffic mới, chờ batch exporter, xem `docker compose logs app1 app2 app3 otel-collector tempo`; xác minh OTLP gRPC `4317` và network `obs_net`.
-
-**Alertmanager không start:** kiểm tra mount `secrets/telegram_bot_token` và cấu hình receiver. Không commit token thật vào `deploy/alertmanager/alertmanager.yml`.
-
-**Jenkins agent không start:** kiểm tra service `jenkins-agent` trong `docker compose --profile ci ps`, `JENKINS_AGENT_SECRET` trong `.env`, quyền `docker.sock` và outbound Internet. Agent phải chạy user `root` và có `host.docker.internal`/`argocd.local` trong `extra_hosts`.
-
-**Argo CD không sync:** kiểm tra branch `deploy` đã được push chưa, `argocd app get portfolio-app`, và log `argocd-repo-server`. Nếu `portfolio-observability` báo `Degraded` do Alloy, xem readiness probe của DaemonSet đó.
-
-**Lỗi tải Go modules:** cần outbound Internet/DNS tới module proxy ở lần đầu; đảm bảo `go.sum` đã được commit và không xóa checksum khi CI build.
-
-**Script báo không tìm thấy network:** Compose project tên `portfolio`, nên network là `portfolio_db_net` / `portfolio_obs_net`. Đặt `DB_NETWORK=portfolio_db_net` hoặc cập nhật tên network trong script tương ứng.
-
-## 14. Cấu trúc repo và tài liệu
-
-```text
-cmd/                     entrypoint server
-internal/                handler, service, repository, auth, middleware, observability, storage
-migrations/              SQL migration
-web/                     HTML template và static assets
-tests/integration/       integration test PostgreSQL
-deploy/
-  postgres/init/         tạo role ứng dụng least-privilege
-  k8s/                   manifest app + PostgreSQL
-  k8s/observability/     manifest Prometheus/Grafana/Loki/Tempo/OTel/Alloy
-  argocd/                cài Argo CD + hai Application
-  ci/                    Dockerfile Jenkins agent
-  jenkins/               Dockerfile + plugins Jenkins controller
-  nginx/, prometheus/, grafana/, loki/, tempo/, otel-collector/, alloy/, alertmanager/
-scripts/                 setup, test, smoke, k8s, Jenkins, Argo CD, GitOps
+```bash
+kubectl apply --server-side -k deploy/argocd
+kubectl -n argocd rollout status deployment/argocd-server --timeout=300s
+kubectl -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
 ```
 
-Tài liệu liên quan:
+### 9.8 Access model
 
-- [`SECURITY.md`](SECURITY.md): phạm vi, giả định, rủi ro và hardening.
-- [`VERIFICATION.md`](VERIFICATION.md): báo cáo kiểm chứng ban đầu (có thể lỗi thời).
-- [`deploy/k8s/README.md`](deploy/k8s/README.md): bootstrap minikube thủ công.
-- [`deploy/k8s/observability/README.md`](deploy/k8s/observability/README.md): monitoring trên minikube.
-- [`deploy/argocd/README.md`](deploy/argocd/README.md): Argo CD, branch model và rollback.
-- [`deploy/ci/README.md`](deploy/ci/README.md): Jenkins agent và cách đăng ký node.
+The Argo CD UI is exposed over plain HTTP at `argocd.local` behind the minikube ingress
+(`server.insecure=true`, `backend-protocol: HTTP`, `ssl-redirect: false`). Keep it local or behind a
+VPN/TLS proxy. Do not expose it publicly.
+
+For least-privilege CI, create a local Argo CD account with `apiKey` capability and a read-only RBAC
+role, then store the token as a Jenkins credential. The bundled pipeline uses the admin password for
+simplicity; replace it before using this outside a homelab.
+
+---
+
+## 10. CI/CD pipeline
+
+### 10.1 Flow
+
+```text
+push/PR to GitHub
+  └─ Jenkins multibranch pipeline (agent label: docker-go)
+       ├─ format/vet → unit tests → PostgreSQL integration → govulncheck
+       ├─ docker build → Trivy scan
+       ├─ publish to Docker Hub            (main only)
+       ├─ copy manifests to `deploy` + bump tag (main only)
+       ├─ argocd app wait                  (main only)
+       └─ k8s-smoke.sh through ingress     (main only)
+```
+
+Pull requests stop after scan. Publish/GitOps/wait/smoke run only on `main`. The pipeline uses
+`disableConcurrentBuilds()` and a 60-minute timeout.
+
+### 10.2 Stages
+
+| Stage | What it does |
+| --- | --- |
+| Checkout | Checks out SCM, computes `IMAGE_TAG=sha-<12>` |
+| Format and vet | `gofmt -l cmd internal tests`, `go vet ./...` |
+| Unit tests | `gotestsum` with `-race -coverprofile`, JUnit report, coverage summary |
+| Database integration tests | Starts `postgres:18` on a per-build port, copies the init script, waits for `portfolio_test`, runs `go test ./tests/integration` |
+| Dependency vulnerability scan | `govulncheck@v1.1.4 ./...` |
+| Build image | `docker build --pull -t nam2107/portfolio:$TAG .` |
+| Container image scan | Trivy: **fails on CRITICAL**, reports HIGH without failing |
+| Publish image | `main` only; logs in with `dockerhub` credential and pushes `:sha-<12>` |
+| Update GitOps branch | `main` only; `ci-gitops-bump.sh` mirrors `deploy/` to branch `deploy` and pins the tag |
+| Wait for Argo CD | `main` only; `argocd app wait` for both Applications (10-minute timeout) |
+| Smoke test | `main` only; `k8s-smoke.sh` against the ingress with `Host: portfolio.local` |
+
+### 10.3 Jenkins controller and agent
+
+- **Controller:** built from `deploy/jenkins/Dockerfile`
+  (`jenkins/jenkins:latest-jdk25`) with the plugins in `deploy/jenkins/plugins.txt`.
+- **Agent:** built from `deploy/ci/Dockerfile` (`jenkins/inbound-agent:latest-jdk21`) plus:
+  - Go 1.27.2
+  - Docker CLI 28.5.2 + buildx
+  - Trivy 0.69.0
+  - kustomize v5.7.1
+  - Argo CD CLI v3.6.1
+  - gotestsum v1.13.0
+  - git, curl, jq, openssl, build tools
+
+The agent mounts `/var/run/docker.sock`, resolves `host.docker.internal` for the integration test
+PostgreSQL, and maps `argocd.local` to the minikube IP for the Argo CLI. It runs as root because of
+the Docker socket mount.
+
+### 10.4 Register the permanent agent
+
+In Jenkins:
+
+1. **Manage Jenkins → Nodes → New node**
+   - Name: `ci-agent` (must match `JENKINS_AGENT_NAME`)
+   - Type: Permanent Agent
+   - Remote root: `/home/jenkins/agent`
+   - Labels: `docker-go`
+   - Usage: only build jobs with label `docker-go`
+   - Launch method: "Launch agent by connecting it to the controller"
+2. Copy the generated secret into `.env` as `JENKINS_AGENT_SECRET`.
+3. Start the controller and agent:
+
+```bash
+./scripts/deploy_jenkins.sh
+# or
+docker compose --env-file .env --profile ci up -d --build jenkins jenkins-agent
+```
+
+4. Confirm the node is online in **Manage Jenkins → Nodes**.
+
+The agent workspace is the `jenkins_agent_work` volume, so Docker builds send their context through
+the Docker API instead of relying on host path mapping. The agent needs outbound internet for Go
+modules, the Trivy database and Docker Hub.
+
+### 10.5 Jenkins credentials
+
+| ID | Type | Content |
+| --- | --- | --- |
+| `dockerhub` | Username/password | Docker Hub username + least-privilege access token |
+| `github-gitops` | Secret text | GitHub PAT allowed to push branch `deploy` |
+| `argocd-admin-password` | Secret text | Argo CD admin password for `argocd app wait` |
+
+Never commit tokens. A Docker Hub token was previously present in a deleted `.gitlab-ci.yml`; it
+remains in Git history and **must be revoked** on Docker Hub.
+
+### 10.6 GitHub webhook through ngrok
+
+```bash
+ngrok http 8081 --domain=<reserved>.ngrok-free.app --basic-auth=<user>:<strong-password>
+```
+
+- Jenkins URL: `https://<reserved>.ngrok-free.app`
+- GitHub → Settings → Webhooks:
+  - Payload URL: `https://<reserved>.ngrok-free.app/github-webhook/`
+  - Content type: `application/json`
+  - Events: `push` and `pull_request`
+- Create a Multibranch Pipeline pointing at the repository.
+
+> **Warning:** Jenkins mounts `/var/run/docker.sock`, which is close to root on the host. ngrok
+> exposes the Jenkins UI to the internet. Enforce basic auth, strong passwords, a webhook secret and
+> disabled anonymous access. Do not expose the agent port or Jenkins CLI.
+
+### 10.7 Pipeline environment and assumptions
+
+| Variable | Value |
+| --- | --- |
+| `IMAGE_REPO` | `nam2107/portfolio` |
+| `GITOPS_BRANCH` | `deploy` |
+| `GITOPS_REPO_URL` | `https://github.com/zetasuna/portfolio.git` |
+| `ARGOCD_HOST` | `argocd.local` |
+| `SMOKE_HOST` | `192.168.49.2` (typical minikube IP) |
+
+If your minikube IP differs, update the `SMOKE_HOST` environment in the Jenkinsfile and the
+`argocd.local` entry in `compose.yaml` (`jenkins-agent.extra_hosts`).
+
+### 10.8 Pipeline caveats
+
+- The integration test uses `host.docker.internal` or falls back to `172.17.0.1`. Adjust `DB_HOST`
+  if your Docker network differs.
+- The Argo wait uses `--plaintext --grpc-web` against the ingress; TLS is not configured.
+- The smoke test runs from the agent container, so it relies on the Host header, not `/etc/hosts`.
+- The pipeline assumes the Argo CD password credential matches the current admin password.
+- The `deploy` branch and `portfolio-*` Applications must exist before `argocd app wait` can pass.
+
+---
+
+## 11. Day-2 operations
+
+### 11.1 Deploy a new image
+
+**Recommended:** commit to `main`, let the pipeline build/push and bump `deploy`, and let Argo CD
+sync.
+
+Emergency/manual fallback:
+
+```bash
+NEW_TAG=dc3aef79b8ac
+(cd deploy/k8s && kustomize edit set image nam2107/portfolio=nam2107/portfolio:"$NEW_TAG")
+kubectl apply -k deploy/k8s
+kubectl -n portfolio rollout status deployment/portfolio --timeout=300s
+```
+
+Or, without kustomize on the PATH:
+
+```bash
+NEW_TAG=dc3aef79b8ac
+kubectl -n portfolio set image deployment/portfolio \
+  migrate=nam2107/portfolio:"$NEW_TAG" \
+  portfolio=nam2107/portfolio:"$NEW_TAG"
+kubectl -n portfolio rollout status deployment/portfolio --timeout=300s
+```
+
+The tag lives only in `deploy/k8s/kustomization.yaml` (`images:`), and Kustomize applies it to both
+the `migrate` init container and the app container. Once Argo CD manages the namespace, manual
+changes are temporary; `selfHeal` reverts them on the next sync.
+
+### 11.2 Change application configuration
+
+```bash
+$EDITOR deploy/k8s/app/configmap.yaml
+kubectl apply -k deploy/k8s
+kubectl -n portfolio rollout restart deployment/portfolio
+```
+
+Important interactions:
+
+- If you change the hostname, update both the Ingress and `ALLOWED_HOSTS`.
+- Keep `portfolio.portfolio.svc.cluster.local` in `ALLOWED_HOSTS` so Prometheus can scrape through
+  the Service DNS name.
+- Set `COOKIE_SECURE=true` and `PUBLIC_BASE_URL=https://...` only after TLS is in place.
+- `TRUST_PROXY_HEADERS=true` is safe only when every request passes through the ingress.
+
+### 11.3 Rotate database credentials
+
+The `portfolio_app` role is created **only on first initialization**. Changing `portfolio-db` after
+the data directory exists does not change the role. Options:
+
+1. **Destructive reset** (dev only): delete the PVC and let PostgreSQL re-initialize.
+2. **Manual rotation** inside PostgreSQL:
+
+```bash
+kubectl -n portfolio exec -it statefulset/postgres -- \
+  psql -U portfolio_admin -d portfolio -c \
+  "ALTER ROLE portfolio_app WITH PASSWORD 'new-password';"
+```
+
+Then update the secret (`APP_DB_PASSWORD` and `DATABASE_URL`) and restart the app. Prefer generating
+new random values rather than reusing old ones.
+
+### 11.4 Reset the database (destroys data)
+
+```bash
+kubectl -n portfolio scale statefulset/postgres --replicas=0
+kubectl -n portfolio delete pvc data-postgres-0
+kubectl -n portfolio scale statefulset/postgres --replicas=1
+kubectl -n portfolio rollout status statefulset/postgres --timeout=300s
+```
+
+If you also rotated `portfolio-db`, delete and recreate the secret first, then scale back up. The
+init script will create the role again against the empty data directory.
+
+### 11.5 Backups
+
+This lab has no automated backups. Named volumes/PVCs are not backups. For anything beyond a demo:
+
+- Back up PostgreSQL with `pg_dump` on a schedule and test restores.
+- Back up the uploads PVC (or move thumbnails to object storage).
+- Store backups off-cluster.
+- Remember that sessions are in PostgreSQL; a restore invalidates sessions created after the dump.
+
+Example logical dump:
+
+```bash
+kubectl -n portfolio exec statefulset/postgres -- \
+  pg_dump -U portfolio_admin -d portfolio -Fc > portfolio.dump
+```
+
+### 11.6 Upgrade pinned components
+
+| Component | Where pinned | Upgrade action |
+| --- | --- | --- |
+| App image | `deploy/k8s/kustomization.yaml` | Pipeline bump or manual `kustomize edit set image` |
+| PostgreSQL | `deploy/k8s/postgres/statefulset.yaml` | Change image, review major-version upgrade path |
+| Prometheus/Loki/Tempo/OTel/Grafana/Alloy/cAdvisor | `deploy/k8s/observability/*.yaml` | Change image, apply, restart, verify |
+| Argo CD | `deploy/argocd/install.yaml` | Replace manifest, server-side apply |
+| CI tools | `deploy/ci/Dockerfile` | Rebuild/publish agent image |
+
+PostgreSQL major upgrades are not automatic. Dump/restore or use `pg_upgrade`; never point a new
+major version at an old `PGDATA` directory without a migration plan.
+
+### 11.7 Clean up drift
+
+```bash
+argocd app diff portfolio-app
+argocd app diff portfolio-observability
+```
+
+If a manual change is intentional, commit it to `main`. If it was accidental, let Argo CD reconcile
+or run `argocd app sync <app>`.
+
+---
+
+## 12. Troubleshooting
+
+### 12.1 App pod
+
+**`ImagePullBackOff` / `ErrImagePull`**
+
+```bash
+kubectl -n portfolio describe pod -l app.kubernetes.io/name=portfolio
+docker manifest inspect nam2107/portfolio:<tag>
+minikube ssh -- sudo crictl pull nam2107/portfolio:<tag>
+```
+
+Check that the tag in `deploy/k8s/kustomization.yaml` exists and that the cluster can reach the
+registry. For a locally built image, use `minikube image load`.
+
+**Pod restarts with `DATABASE_URL is required`**
+
+```bash
+kubectl -n portfolio get secret portfolio-db -o jsonpath='{.data.DATABASE_URL}' | base64 -d; echo
+```
+
+The secret must exist and contain a valid `postgres://` URL before the app starts.
+
+**Pod logs `postgres remained unavailable`**
+
+```bash
+kubectl -n portfolio logs statefulset/postgres --tail=100
+kubectl -n portfolio get pods -l app.kubernetes.io/name=postgres
+kubectl -n portfolio exec statefulset/postgres -- psql -U portfolio_admin -d portfolio -c '\du'
+```
+
+The app waits up to 90 seconds for PostgreSQL. Check PVC binding, the headless Service and the
+`portfolio-db` credentials.
+
+**Init container `fix-perms` fails**
+
+```bash
+kubectl -n portfolio logs deployment/portfolio -c fix-perms
+kubectl -n portfolio describe pvc portfolio-uploads
+```
+
+The PVC must be bound. The init container needs `CHOWN`, `DAC_OVERRIDE` and `FOWNER` to change
+ownership to `65532:65532`.
+
+### 12.2 Ingress and HTTP
+
+**Ingress returns 404**
+
+```bash
+kubectl -n ingress-nginx get pods
+kubectl -n portfolio describe ingress portfolio
+getent hosts portfolio.local
+curl -i -H 'Host: portfolio.local' "http://$(minikube ip)/healthz"
+```
+
+Ingress matches on the `Host` header. Requesting the minikube IP without it hits the default backend.
+
+**`/readyz` returns 503**
+
+The database ping failed. Check PostgreSQL and the secret; `/healthz` should still return 200.
+
+**Login returns 429**
+
+The app rate-limits `/admin/login` to 5 requests/minute per IP. Wait a minute, or restart:
+
+```bash
+kubectl -n portfolio rollout restart deployment/portfolio
+```
+
+With multiple replicas, limits are per pod (in-memory), so the effective limit is higher.
+
+**Upload fails with permission denied**
+
+```bash
+kubectl -n portfolio logs deployment/portfolio -c fix-perms
+kubectl -n portfolio exec deployment/portfolio -- /app/portfolio healthcheck
+kubectl -n portfolio exec deployment/portfolio -- ls -ld /app/uploads
+```
+
+Expected owner: `65532:65532`, mode `0750`.
+
+### 12.3 Database
+
+**`portfolio_app` role does not exist / authentication fails**
+
+The init script only runs on an empty `PGDATA`. If the secret changed after first start:
+
+- reset the database (see [11.4](#114-reset-the-database-destroys-data)), or
+- create/alter the role manually and update the secret.
+
+**PVC stays `Pending`**
+
+```bash
+kubectl -n portfolio describe pvc data-postgres-0
+kubectl get storageclass
+kubectl get pods -n kube-system
+```
+
+Check the minikube storage provisioner and available disk.
+
+### 12.4 Metrics
+
+**Prometheus reports `portfolio-app` DOWN with HTTP 421**
+
+The app rejects unknown `Host` headers. Confirm `ALLOWED_HOSTS` includes
+`portfolio.portfolio.svc.cluster.local`:
+
+```bash
+kubectl -n portfolio get configmap portfolio-app-config -o jsonpath='{.data.ALLOWED_HOSTS}'; echo
+kubectl apply -k deploy/k8s
+kubectl -n portfolio rollout restart deployment/portfolio
+```
+
+Then check the target again in Prometheus.
+
+**cAdvisor CrashLoopBackOff**
+
+```bash
+kubectl -n observability logs ds/cadvisor --tail=80
+kubectl -n observability describe pod -l app.kubernetes.io/name=cadvisor
+minikube ssh -- ls -l /run/containerd/containerd.sock
+```
+
+cAdvisor runs privileged and mounts host `/`, `/sys`, `/run`, `/var/lib/containerd` and `/dev/disk`.
+If your minikube node uses the Docker runtime, remove `--containerd=/run/containerd/containerd.sock`
+and mount `/var/lib/docker` instead.
+
+### 12.5 Logs
+
+**Loki has no logs**
+
+```bash
+kubectl -n observability logs ds/alloy --tail=100
+kubectl -n portfolio logs deploy/portfolio --tail=5
+kubectl auth can-i list pods --as=system:serviceaccount:observability:alloy
+```
+
+- The `portfolio-alloy-logs` ClusterRole must allow `pods`, `pods/log`, `namespaces`.
+- Alloy only tails the `portfolio` namespace.
+- Generate traffic after Alloy starts.
+- The app logs one JSON object per line; use `| json` in LogQL for fields other than `level` and
+  `service`.
+
+**Alloy CrashLoop `mkdir /var/lib/alloy/data: permission denied`**
+
+Run Alloy as uid/gid `473` with `fsGroup: 473`. The image's `/var/lib/alloy` is `0770` and owned by
+that group; any other uid cannot traverse it.
+
+### 12.6 Traces
+
+**Tempo has no traces**
+
+```bash
+kubectl -n portfolio logs deploy/portfolio | grep -i otlp | tail
+kubectl -n observability logs deploy/otel-collector --tail=50
+kubectl -n observability logs deploy/tempo --tail=50
+kubectl -n portfolio get deploy portfolio -o jsonpath='{.spec.template.spec.containers[0].envFrom}'
+```
+
+Also:
+
+- Confirm the app pod has `OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector.observability.svc.cluster.local:4317`.
+- Generate new traffic; traces are batched and exported every ~2 seconds.
+- Ensure the collector and Tempo are Ready.
+
+### 12.7 Grafana
+
+**Grafana stays `0/1` for several minutes**
+
+Grafana 13 registers bundled plugins at startup and takes 1–5 minutes on a small node. The manifest
+allows 5 minutes via `startupProbe`. If it still fails:
+
+```bash
+kubectl -n observability describe pod -l app.kubernetes.io/name=grafana
+kubectl -n observability top pods
+```
+
+Raise the memory limit or recreate minikube with more RAM.
+
+**Grafana returns 404 through `grafana.local`**
+
+```bash
+getent hosts grafana.local
+kubectl -n observability get ingress
+kubectl -n ingress-nginx get pods
+curl -i -H 'Host: grafana.local' "http://$(minikube ip)/api/health"
+```
+
+**Wrong Grafana password after changing the secret**
+
+`GF_SECURITY_ADMIN_PASSWORD` is only used on first database initialization. Reset explicitly:
+
+```bash
+kubectl -n observability exec deploy/grafana -- \
+  grafana cli admin reset-admin-password 'new-password'
+```
+
+### 12.8 Resource pressure
+
+**`Pending`, `OOMKilled`, or evictions**
+
+```bash
+kubectl -n observability describe pod <pod>
+kubectl top pods -n observability
+kubectl describe node minikube | sed -n '/Allocated resources/,/Events/p'
+```
+
+Options:
+
+- Increase minikube memory (`minikube stop && minikube start --memory=8192`).
+- Remove the observability stack if you only need the app:
+  `./scripts/k8s-teardown.sh monitoring`.
+- Lower limits, but keep Grafana at least 512 Mi to avoid boot failures.
+
+### 12.9 Argo CD
+
+**Argo CD does not sync**
+
+```bash
+argocd app get portfolio-app
+kubectl -n argocd logs deployment/argocd-repo-server --tail=50
+kubectl -n argocd logs statefulset/argocd-application-controller --tail=50
+git ls-remote --heads origin deploy
+```
+
+Check that:
+
+- the `deploy` branch exists and contains the expected manifests;
+- the image tag exists on Docker Hub;
+- the repo is reachable from the cluster (public repo needs no credentials);
+- the Application's `targetRevision` is `deploy`, not `main`.
+
+**Application is `Degraded` but `Synced`**
+
+The manifests are applied but a workload is unhealthy. Check the specific Deployment/DaemonSet,
+especially Alloy. Argo health is only as good as the workload probes.
+
+**`argocd app wait` fails in Jenkins**
+
+- Verify `argocd.local` resolves inside the agent (`extra_hosts` in `compose.yaml`).
+- Verify the `argocd-admin-password` credential matches the current admin password.
+- Check that both Applications exist and are not stuck on a bad image.
+
+### 12.10 Jenkins
+
+**Agent is offline**
+
+- Check the agent secret in `.env` matches the Jenkins node secret.
+- `docker compose --profile ci logs jenkins-agent`.
+- Confirm the controller URL `http://jenkins:8080` is reachable on the Compose network.
+
+**Integration test cannot reach PostgreSQL**
+
+The pipeline publishes PostgreSQL on a per-build port and reaches it via `host.docker.internal` or
+`172.17.0.1`. If neither works, set `DB_HOST` to the host gateway address for your Docker setup.
+
+**Trivy scan fails on CRITICAL**
+
+Review the finding, update the base image or dependency, and rebuild. Do not suppress the scan
+without a documented exception.
+
+---
+
+## 13. Teardown
+
+```bash
+./scripts/k8s-teardown.sh                    # app only (portfolio namespace, DB + uploads)
+./scripts/k8s-teardown.sh monitoring         # observability only
+./scripts/k8s-teardown.sh all                # both
+./scripts/k8s-teardown.sh all --disable-ingress
+```
+
+The script asks for confirmation (`yes`). Deleting the `portfolio` namespace deletes the PostgreSQL
+volume and uploaded files. Deleting `observability` deletes Prometheus/Loki/Tempo/Grafana data.
+
+`monitoring` also removes the cluster-scoped `portfolio-alloy-logs` ClusterRole and
+ClusterRoleBinding, which a plain namespace delete would leave behind.
+
+Remove host entries if desired:
+
+```bash
+sudo sed -i '/\(portfolio\|grafana\|argocd\)\.local/d' /etc/hosts
+```
+
+To remove everything including the cluster:
+
+```bash
+minikube delete
+```
+
+---
+
+## 14. Security notes
+
+This is a learning/homelab project. The controls below reduce risk but do not make it production
+ready.
+
+### 14.1 Known residual risks
+
+- **No TLS:** `portfolio.local`, `grafana.local` and `argocd.local` are plain HTTP. `COOKIE_SECURE`
+  is `false`. Do not expose them beyond localhost/VPN.
+- **Jenkins Docker socket:** `/var/run/docker.sock` is effectively root on the host. Restrict who
+  can administer Jenkins, do not run untrusted Jenkinsfiles, and prefer isolated agents for
+  higher-assurance use.
+- **Hardcoded Telegram token:** `deploy/alertmanager/alertmanager.yml` contains a bot token for the
+  Compose Alertmanager. It should be revoked and moved to a secret (for example, a Docker secret or
+  environment variable) before further use.
+- **Historical Docker Hub token:** a token was removed from a deleted `.gitlab-ci.yml` but remains
+  in Git history. Revoke it on Docker Hub.
+- **Single points of failure:** one PostgreSQL instance, one Nginx/ingress, one Jenkins, one
+  observability backend. Three app replicas do not make the whole system highly available.
+- **Local storage:** PVCs are node-local and not backups. Multi-node or multi-host deployment needs a
+  different storage design.
+- **Trusted proxy headers:** `TRUST_PROXY_HEADERS=true` is only correct when every request passes
+  through a proxy that overwrites `X-Real-IP`. Do not publish app ports directly.
+- **Uploads:** JPEG/PNG decoders are attack surface. Keep Go and dependencies updated, retain the
+  5 MiB limit, and consider malware scanning outside the lab.
+- **In-memory rate limits:** per-pod state. Multiple replicas multiply the effective limit, and a
+  restart clears it.
+
+### 14.2 Hardening checklist before exposure
+
+1. Terminate TLS at a maintained reverse proxy with automatic certificate renewal.
+2. Allow inbound traffic only to 80/443 at the edge; keep admin/observability ports on localhost or
+   VPN.
+3. Set `COOKIE_SECURE=true`, `PUBLIC_BASE_URL=https://your-domain`, and add the hostname to
+   `ALLOWED_HOSTS`.
+4. Ensure the proxy overwrites `X-Real-IP`, `X-Forwarded-For` and `X-Forwarded-Proto`; trust only
+   known proxies.
+5. Enable HSTS only after HTTPS is verified for all relevant hostnames.
+6. Move secrets to a proper secret manager; never commit `.env`, tokens or kubeconfigs.
+7. Rotate the exposed Telegram token and the historical Docker Hub token.
+8. Add network policies if you add more tenants/workloads.
+9. Back up PostgreSQL and uploads, and test restore.
+10. Keep the Argo CD admin password (or use a scoped API token) and Jenkins credentials in a safe
+    store.
+
+---
+
+## 15. Appendix A — Docker Compose
+
+Compose is useful when you have not installed minikube or want a full local development stack on one
+machine. It is **not** the production-like path.
+
+### 15.1 What Compose runs
+
+- **3 app instances** (`app1`, `app2`, `app3`) behind Nginx with `least_conn` load balancing.
+- PostgreSQL 18, Nginx (unprivileged), Jenkins controller, GitLab CE, and the observability stack:
+  Prometheus, Alertmanager, node-exporter, cAdvisor, Loki, Tempo, OTel Collector, Alloy, Grafana.
+- `jenkins-agent` is behind the `ci` profile (16 services by default, 17 with the profile).
+- There is no Argo CD; deployment is direct `docker compose`.
+
+### 15.2 Quick start
+
+```bash
+./scripts/setup.sh          # creates .env with random secrets, mode 0600
+nano .env                   # review PROJECT_DIR, ALLOWED_HOSTS, public URL, ports
+./scripts/deploy.sh         # docker compose config + up -d --build
+./scripts/create-admin.sh   # first admin via app1
+```
+
+Access:
+
+| Service | URL |
+| --- | --- |
+| Website | <http://127.0.0.1:8080> |
+| Admin | <http://127.0.0.1:8080/admin/login> |
+| Grafana | <http://127.0.0.1:3000> |
+| Jenkins | <http://127.0.0.1:8081> |
+| Prometheus | <http://127.0.0.1:9090> |
+| Alertmanager | <http://127.0.0.1:9093> |
+| GitLab | <http://127.0.0.1:8070> |
+
+### 15.3 Compose verification scripts
+
+```bash
+./scripts/smoke.sh              # health checks + observes app1/app2/app3
+./scripts/curl-crud.sh          # CSRF-aware admin CRUD
+./scripts/integration-test.sh   # PostgreSQL integration test
+./scripts/verify-observability.sh
+./scripts/acceptance.sh         # compose config + smoke + observability
+```
+
+`smoke.sh` is Compose-specific: it asserts the `X-App-Instance` header cycles through `app1`,
+`app2` and `app3`.
+
+### 15.4 Compose caveats
+
+- `app1` defaults to host port `8081`, which collides with Jenkins. If you run both, set
+  `APP1_HOST_PORT=18081` (or change `JENKINS_HOST_PORT`) in `.env`.
+- All host port bindings default to `127.0.0.1`; this is intentional.
+- `app1` runs `start` (migrations then serve); `app2` and `app3` run `serve`, so migrations run once.
+- The app containers are read-only with a `tmpfs` `/tmp`, drop all capabilities, and use
+  `no-new-privileges`.
+- Compose observability includes node-exporter and Alertmanager; Kubernetes does not.
+- Do not commit `.env`, `secrets/` or tokens.
+
+### 15.5 Compose ports reference
+
+| Variable | Default |
+| --- | --- |
+| `APP1_HOST_PORT` | `8081` |
+| `APP2_HOST_PORT` | `8082` |
+| `APP3_HOST_PORT` | `8083` |
+| `NGINX_HOST_PORT` | `8080` |
+| `POSTGRESQL_HOST_PORT` | `5432` |
+| `GRAFANA_HOST_PORT` | `3000` |
+| `PROMETHEUS_HOST_PORT` | `9090` |
+| `ALERTMANAGER_HOST_PORT` | `9093` |
+| `JENKINS_HOST_PORT` | `8081` |
+| `GITLAB_HOST_PORT` | `8070` |
+| `LOKI_HOST_PORT` | `3100` |
+| `OTEL_GRPC_HOST_PORT` | `4317` |
+| `OTEL_HTTP_HOST_PORT` | `4318` |
+
+---
+
+## 16. Appendix B — Kubernetes vs Compose
+
+| Aspect | Kubernetes (minikube) | Docker Compose |
+| --- | --- | --- |
+| App replicas | 1 (scale manually) | 3 behind Nginx |
+| Deployment model | Argo CD GitOps from `deploy` branch | `docker compose up` |
+| Database | StatefulSet + 2 Gi PVC | `postgres_data` volume |
+| Uploads | 1 Gi PVC | `uploads_data` volume |
+| Ingress | minikube ingress-nginx, `*.local` | Nginx on `127.0.0.1:8080` |
+| Metrics | Prometheus + cAdvisor | Prometheus + cAdvisor + node-exporter |
+| Logs | Loki + Alloy (Kubernetes API) | Loki + Alloy (Docker log files) |
+| Traces | OTel Collector → Tempo | OTel Collector → Tempo |
+| Alerting | Prometheus rules only (no Alertmanager) | Alertmanager + Telegram receiver |
+| Jenkins | Controller/agent via Compose, deploys through GitOps | Optional controller/agent |
+| GitLab CE | Not deployed | Included (runner commented out) |
+| TLS | None | None |
+| Best for | Production-like lab / GitOps demo | Fast local development |
+
+---
+
+## 17. Documentation and verification
+
+### Detailed runbooks
+
+- [`deploy/k8s/README.md`](deploy/k8s/README.md) — app + PostgreSQL minikube runbook.
+- [`deploy/k8s/observability/README.md`](deploy/k8s/observability/README.md) — monitoring, logs and
+  traces on minikube.
+- [`deploy/argocd/README.md`](deploy/argocd/README.md) — Argo CD, branch model, rollback.
+- [`deploy/ci/README.md`](deploy/ci/README.md) — Jenkins agent image and node registration.
+- [`SECURITY.md`](SECURITY.md) — assumptions, residual risks, hardening.
+- [`VERIFICATION.md`](VERIFICATION.md) — packaging-time verification report (may be outdated).
+
+### What was checked in this repository
+
+- Kustomize rendering, YAML/JSON parsing and shell script syntax.
+- App + PostgreSQL manifests, migrations, health/readiness probes and the admin bootstrap flow.
+- Observability manifests, Prometheus scrape config, Grafana provisioning, Loki/Alloy and
+  Tempo/OTel wiring.
+- Unit tests, PostgreSQL integration tests and the Jenkinsfile stage structure.
+- README structure: balanced code fences, valid relative links and internal anchors.
+
+### What still requires a real credentials/environment
+
+- Argo CD bootstrap and first sync (during the last validation the `deploy` branch had not been
+  pushed and Argo CD had not been installed into the cluster).
+- GitHub webhook delivery through ngrok.
+- Docker Hub login/push and the `github-gitops` PAT.
+- The full Jenkins pipeline end to end (agent online, registry access, cluster reachable).
+- Rollback and restore procedures.
+
+Run these on a host with Docker, Go 1.27.2 and network access:
+
+```bash
+go mod tidy
+gofmt -w cmd internal tests
+go vet ./...
+go test ./... -race -coverprofile=coverage.out
+go tool cover -func=coverage.out | tail -n 1
+
+./scripts/setup.sh
+docker compose config
+docker compose up -d --build
+docker compose ps
+./scripts/create-admin.sh
+./scripts/smoke.sh
+./scripts/curl-crud.sh
+./scripts/integration-test.sh
+./scripts/verify-observability.sh
+./scripts/acceptance.sh
+```
+
+For Kubernetes, after deployment:
+
+```bash
+./scripts/k8s-smoke.sh
+./scripts/k8s-create-admin.sh
+BASE_URL=http://portfolio.local ./scripts/curl-crud.sh
+kubectl -n observability get pods
+```
+
+Remember: scans and smoke tests reduce uncertainty; they do not prove the absence of
+vulnerabilities. Review every HIGH/CRITICAL finding and keep dependencies, images, secrets and host
+hardening up to date.
