@@ -4,7 +4,9 @@ namespace: observability
 resources:
   - namespace.yaml
   - prometheus.yaml
+  - alertmanager.yaml
   - cadvisor.yaml
+  - node-exporter.yaml
   - loki.yaml
   - tempo.yaml
   - otel-collector.yaml
@@ -15,6 +17,9 @@ configMapGenerator:
     files:
       - prometheus.yml=config/prometheus.yml
       - alert.rules.yml=config/alert.rules.yml
+  - name: alertmanager-config
+    files:
+      - alertmanager.yml=config/alertmanager.yml
   - name: loki-config
     files:
       - loki.yml=config/loki.yml

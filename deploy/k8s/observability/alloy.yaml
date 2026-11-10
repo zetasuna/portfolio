@@ -72,12 +72,26 @@ spec:
           ports:
             - name: http
               containerPort: 12345
+          startupProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /-/ready
               port: http
             periodSeconds: 10
+            timeoutSeconds: 3
             failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m

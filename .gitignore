@@ -11,3 +11,4 @@ reports/
 .idea/
 .vscode/
 /release.env
+secrets/

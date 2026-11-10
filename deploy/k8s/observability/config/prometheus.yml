@@ -1,16 +1,25 @@
 global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+  scrape_interval: 5s
+  evaluation_interval: 5s
   external_labels:
     environment: minikube
 
 rule_files:
   - /etc/prometheus/alert.rules.yml
 
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager.observability.svc.cluster.local:9093"]
+
 scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: ["127.0.0.1:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager.observability.svc.cluster.local:9093"]
 
   # The in-cluster Service for the Go app. Its Host header is added to
   # ALLOWED_HOSTS in deploy/k8s/app/configmap.yaml, otherwise the app's
@@ -22,6 +31,12 @@ scrape_configs:
       - targets: ["portfolio.portfolio.svc.cluster.local:80"]
         labels:
           app_instance: portfolio
+
+  # node-exporter runs as a hostNetwork DaemonSet, so the Service resolves to
+  # the node IP on port 9100. The host dashboard uses job="node-exporter".
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter.observability.svc.cluster.local:9100"]
 
   - job_name: cadvisor
     static_configs:

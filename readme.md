@@ -67,8 +67,8 @@ GitHub ──► Jenkins (CI) ──► Docker Hub ──► branch `deploy` ─
 
 ### How it is deployed
 
-- **minikube** with the `ingress` addon. Three hostnames map into three namespaces:
-  `portfolio.local`, `grafana.local`, `argocd.local`.
+- **minikube** with the `ingress` addon. Four hostnames map into three namespaces:
+  `portfolio.local`, `grafana.local`, `alertmanager.local`, `argocd.local`.
 - **Kustomize** is the renderer. The image tag lives in exactly one place:
   `deploy/k8s/kustomization.yaml`.
 - **Argo CD** watches the `deploy` branch and reconciles two Applications.
@@ -129,7 +129,8 @@ GitHub ──► Jenkins (CI) ──► Docker Hub ──► branch `deploy` ─
 - PVC-backed uploads directory with an init container that fixes ownership.
 - Rolling updates with `maxUnavailable: 0`, `maxSurge: 1`.
 - Probes that do not depend on the database for liveness.
-- Prometheus metrics, Grafana dashboards/datasources, Loki logs, Tempo traces, cAdvisor metrics.
+- Prometheus metrics, Alertmanager alert routing, Grafana dashboards/datasources, Loki logs, Tempo
+  traces, cAdvisor container metrics and node-exporter host metrics.
 - Argo CD auto-sync with prune and self-heal.
 - Jenkins declarative pipeline with gofmt/vet, race tests, integration tests, `govulncheck`, Trivy,
   image publish, GitOps bump, Argo wait and ingress smoke test.
@@ -157,8 +158,10 @@ flowchart TB
   G[Grafana] --> P
   G --> L
   G --> T
+  P --> AM[Alertmanager]
 
   I -->|grafana.local| G
+  I -->|alertmanager.local| AM
   I -->|argocd.local| AR[Argo CD]
   AR -. sync deploy branch .-> D
   AR -. sync deploy branch .-> P
@@ -174,9 +177,9 @@ flowchart TB
 | `portfolio` | `portfolio` | Service (ClusterIP) | `80 → 8080` |
 | `portfolio` | `portfolio` | Ingress | `portfolio.local` |
 | `portfolio` | `create-admin` | Job (on demand) | One-shot admin bootstrap |
-| `observability` | `prometheus`, `grafana`, `loki`, `tempo`, `otel-collector` | Deployments | Metrics, dashboards, logs, traces |
-| `observability` | `cadvisor`, `alloy` | DaemonSets | Container metrics, pod log collection |
-| `observability` | `grafana` | Ingress | `grafana.local` |
+| `observability` | `prometheus`, `alertmanager`, `grafana`, `loki`, `tempo`, `otel-collector` | Deployments | Metrics, alert routing, dashboards, logs, traces |
+| `observability` | `cadvisor`, `node-exporter`, `alloy` | DaemonSets | Container metrics, host metrics, pod log collection |
+| `observability` | `grafana`, `alertmanager` | Ingresses | `grafana.local`, `alertmanager.local` |
 | `argocd` | Argo CD + two Applications | Deployments/StatefulSet + CRs | GitOps CD |
 | `argocd` | `argocd` | Ingress | `argocd.local` |
 
@@ -186,6 +189,7 @@ flowchart TB
 | --- | --- | --- | --- |
 | `portfolio.local` | `portfolio` | `portfolio:80 → 8080` | Body limit 10m, proxy read timeout 35s |
 | `grafana.local` | `observability` | `grafana:3000` | No TLS |
+| `alertmanager.local` | `observability` | `alertmanager:9093` | No auth, no TLS; keep local/VPN |
 | `argocd.local` | `argocd` | `argocd-server:80` | `server.insecure=true`, HTTP backend |
 
 All routes go through the minikube `ingress-nginx` controller. There is **no TLS** in the lab. Use
@@ -210,7 +214,9 @@ this only locally, on a trusted network, or behind a VPN/TLS proxy.
 | App | 50m | 500m | 64Mi | 256Mi | uploads PVC 1Gi |
 | PostgreSQL | 100m | 500m | 256Mi | 512Mi | data PVC 2Gi |
 | Prometheus | 100m | 400m | 192Mi | 384Mi | 2Gi |
+| Alertmanager | 20m | 100m | 32Mi | 128Mi | 1Gi |
 | cAdvisor | 50m | 300m | 128Mi | 256Mi | host mounts |
+| node-exporter | 20m | 100m | 32Mi | 64Mi | host mounts |
 | Loki | 50m | 300m | 128Mi | 320Mi | 2Gi |
 | Tempo | 50m | 300m | 128Mi | 256Mi | 2Gi |
 | OTel Collector | 50m | 200m | 64Mi | 256Mi | — |
@@ -225,7 +231,7 @@ The default ~3.8 GiB node is very tight once Grafana, Prometheus, Loki and Tempo
 
 - Pod-level `seccompProfile: RuntimeDefault`.
 - `automountServiceAccountToken: false` on the app, PostgreSQL, Prometheus, Loki, Tempo, OTel
-  Collector, Grafana, cAdvisor.
+  Collector, Grafana, cAdvisor and node-exporter.
 - App and init containers:
   - `runAsNonRoot`, uid/gid `65532`
   - `readOnlyRootFilesystem: true`
@@ -234,6 +240,8 @@ The default ~3.8 GiB node is very tight once Grafana, Prometheus, Loki and Tempo
 - Only the `fix-perms` init container runs as root, with the minimum extra capabilities
   (`CHOWN`, `DAC_OVERRIDE`, `FOWNER`) to fix the uploads volume.
 - `cadvisor` is privileged by necessity (host metrics); it mounts host paths read-only.
+- `node-exporter` uses `hostNetwork` + `hostPID` to read host metrics, but runs as `65534`, drops all
+  capabilities, uses a read-only root filesystem and mounts host `/proc`, `/sys` and `/` read-only.
 - Alloy uses a namespaced ServiceAccount plus a cluster-scoped `ClusterRole` limited to
   `pods`, `pods/log`, `namespaces`.
 
@@ -325,7 +333,7 @@ Add observability:
 
 ```bash
 ./scripts/k8s-monitoring-deploy.sh
-echo "$(minikube ip) grafana.local portfolio.local" | sudo tee -a /etc/hosts
+echo "$(minikube ip) grafana.local alertmanager.local portfolio.local" | sudo tee -a /etc/hosts
 ```
 
 Add GitOps:
@@ -368,7 +376,7 @@ web/                         html/template files + static assets
 tests/integration/           PostgreSQL integration test
 deploy/
   k8s/                       app + PostgreSQL Kustomize base
-  k8s/observability/         Prometheus/cAdvisor/Loki/Alloy/Tempo/OTel/Grafana
+  k8s/observability/         Prometheus/Alertmanager/cAdvisor/node-exporter/Loki/Alloy/Tempo/OTel/Grafana
   argocd/                    pinned Argo CD install + Applications
   ci/                        Jenkins agent image
   jenkins/                   Jenkins controller image + plugins
@@ -594,7 +602,9 @@ Notes:
 | Component | Image | Role |
 | --- | --- | --- |
 | `prometheus` | `prom/prometheus:v3.15.1` | Scrapes `/metrics`, evaluates alert rules, 24h retention |
+| `alertmanager` | `prom/alertmanager:v0.28.1` | Receives alerts from Prometheus, groups/inhibits, Telegram delivery |
 | `cadvisor` | `gcr.io/cadvisor/cadvisor:v0.55.1` | Container CPU/memory/network/filesystem metrics (DaemonSet, privileged) |
+| `node-exporter` | `prom/node-exporter:v1.12.1` | Host CPU/memory/filesystem/network metrics (DaemonSet, hostNetwork) |
 | `loki` | `grafana/loki:3.7.9` | Log storage, 7-day (168h) retention |
 | `alloy` | `grafana/alloy:v1.21.3` | Tails pod logs through the Kubernetes API and pushes to Loki |
 | `tempo` | `grafana/tempo:3.1.1` | Trace storage on a local PVC |
@@ -607,6 +617,7 @@ Notes:
 flowchart LR
   APP[portfolio app] -- /metrics --> P[Prometheus]
   CAD[cAdvisor] -- /metrics --> P
+  NE[node-exporter] -- /metrics --> P
   APP -- OTLP gRPC 4317 --> OC[OTel Collector]
   OC -- OTLP 4317 --> T[Tempo]
   APP -- JSON stdout --> AL[Alloy]
@@ -614,6 +625,7 @@ flowchart LR
   G[Grafana] --> P
   G --> L
   G --> T
+  P --> AM[Alertmanager]
 ```
 
 Details:
@@ -628,26 +640,32 @@ Details:
   in the log line (filter with `| json`).
 - **Traces:** the app uses OTLP gRPC with a 2s batch timeout. The collector applies a 128 MiB memory
   limiter and a 512-span batch, then forwards to Tempo. Tempo stores blocks and WAL on a PVC.
+- **Alerts:** Prometheus evaluates the rules in `config/alert.rules.yml` and sends firing/resolved
+  alerts to `alertmanager.observability.svc.cluster.local:9093`. Alertmanager groups them, applies
+  the critical-over-warning inhibition rule, and routes them to the `default` Telegram receiver.
 
 ### 8.3 Deploy
 
 ```bash
 ./scripts/k8s-monitoring-deploy.sh
-echo "$(minikube ip) grafana.local portfolio.local" | sudo tee -a /etc/hosts
+echo "$(minikube ip) grafana.local alertmanager.local portfolio.local" | sudo tee -a /etc/hosts
 ```
 
 The script:
 
 1. Creates the `observability` namespace.
 2. Reuses `grafana-admin` if present; otherwise generates an admin password.
-3. Enables the ingress addon if `ingress-nginx` is missing and waits for the controller.
-4. Applies `deploy/k8s/observability`.
-5. If the `portfolio` namespace exists, re-applies `deploy/k8s` to refresh the OTLP endpoint and
+3. Reuses `alertmanager-telegram` if present; otherwise creates it from `TELEGRAM_BOT_TOKEN`, from
+   `secrets/telegram_bot_token`, or with a placeholder token and a warning.
+4. Enables the ingress addon if `ingress-nginx` is missing and waits for the controller.
+5. Applies `deploy/k8s/observability`.
+6. If the `portfolio` namespace exists, re-applies `deploy/k8s` to refresh the OTLP endpoint and
    scrape host, then restarts the app.
-6. Waits for Prometheus, Loki, Tempo, OTel Collector, Grafana, cAdvisor and Alloy.
-7. Prints Grafana credentials and access instructions.
+7. Waits for Prometheus, Alertmanager, Loki, Tempo, OTel Collector, Grafana, cAdvisor, node-exporter
+   and Alloy.
+8. Prints Grafana credentials and access instructions.
 
-### 8.4 Grafana access and credential behavior
+### 8.4 Grafana and Alertmanager access
 
 ```bash
 kubectl -n observability get secret grafana-admin \
@@ -669,6 +687,28 @@ Open <http://grafana.local>.
 Grafana 13 registers bundled plugins on startup and can take **1–5 minutes** on a small node. The
 manifest uses a 5-minute `startupProbe` (60 × 10s) so liveness does not kill it mid-boot.
 
+#### Alertmanager
+
+Open <http://alertmanager.local> after adding the host entry. The UI lists active alerts and lets you
+create silences. It has **no authentication**, so keep it on localhost/VPN.
+
+The `default` receiver sends firing and resolved alerts to Telegram. The bot token is read from the
+`alertmanager-telegram` Secret (key `telegram_bot_token`) through `bot_token_file`; it is never in
+the ConfigMap or Git. The deploy script creates the Secret from `TELEGRAM_BOT_TOKEN`,
+`secrets/telegram_bot_token`, or a placeholder.
+
+If you need to set or rotate the token after deployment:
+
+```bash
+kubectl -n observability create secret generic alertmanager-telegram \
+  --from-literal=telegram_bot_token='<telegram-bot-token>' \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n observability rollout restart deployment/alertmanager
+```
+
+The target chat ID (`chat_id`) is configured in
+`deploy/k8s/observability/config/alertmanager.yml`. Update it there if you use a different chat.
+
 ### 8.5 Verify metrics
 
 ```bash
@@ -687,7 +727,16 @@ for t in json.load(sys.stdin)["data"]["activeTargets"]:
 '
 ```
 
-Expected jobs: `prometheus`, `portfolio-app`, `cadvisor`, `loki`, `tempo`, `otel-collector`.
+Expected jobs: `prometheus`, `alertmanager`, `portfolio-app`, `node-exporter`, `cadvisor`, `loki`,
+`tempo`, `otel-collector`.
+
+Check Alertmanager health and its view of the alerts:
+
+```bash
+kubectl -n observability port-forward svc/alertmanager 9093:9093 >/dev/null &
+curl -s http://127.0.0.1:9093/-/ready
+curl -s http://127.0.0.1:9093/api/v2/alerts | head -c 500
+```
 
 Check the app's own metrics endpoint:
 
@@ -709,8 +758,8 @@ In Grafana:
 - **Dashboards → Portfolio**
   - `Portfolio Service Overview`
   - `Portfolio - cAdvisor / Containers`
-  - `Portfolio - Node Exporter / Host` — **stays empty** in Kubernetes because node-exporter is not
-    deployed there (it exists only in Compose).
+  - `Portfolio - Node Exporter / Host` — host CPU, memory, filesystem, network, load and exporter
+    health from `job="node-exporter"`.
 - **Explore → Loki**
   - `{service="portfolio-app"}` or `{namespace="portfolio"}`
   - Add `| json` to filter on fields such as `trace_id`, `request_id`, `status`, `duration_ms`.
@@ -718,6 +767,9 @@ In Grafana:
   - Query type **Search**, service name `portfolio-app`.
   - Open a trace; the "Logs for this span" link uses the Loki datasource.
   - Loki has a derived field that turns a 32-hex `trace_id` in a log line into a "View trace" link.
+
+For alerts, open <http://alertmanager.local> to see active alerts, the notification log and silences.
+Prometheus also shows the same rules under **Status → Rules** and **Alerts**.
 
 Without Grafana:
 
@@ -737,39 +789,51 @@ Kubernetes uses `deploy/k8s/observability/config/alert.rules.yml`, which contain
 | --- | --- | --- |
 | `PrometheusTargetDown` | `up == 0` | 2m |
 | `PortfolioAppDown` | `up{job="portfolio-app"} == 0` | 1m |
+| `HostHighCPU` | node CPU busy > 85% | 10m |
+| `HostHighMemory` | node memory used > 90% | 10m |
+| `HostFilesystemAlmostFull` | node filesystem used > 85% | 10m |
 | `ContainerHighMemory` | container working set / limit > 85% | 10m |
 
-**There is no Alertmanager in the Kubernetes stack.** Alerts appear in the Prometheus UI under
-Alerts, but no notifications are delivered. If you need delivery, add Alertmanager and a receiver,
-and keep credentials in a Secret. The Compose stack includes Alertmanager + node-exporter, but its
-Telegram receiver currently contains a hardcoded bot token — see [Security notes](#14-security-notes).
+Alertmanager (`prom/alertmanager:v0.28.1`) receives these rules from Prometheus at
+`alertmanager.observability.svc.cluster.local:9093` and routes them through the `default` Telegram
+receiver. It is also scraped as `job="alertmanager"`, so `PrometheusTargetDown` covers it.
+
+The bot token is mounted from the `alertmanager-telegram` Secret via `bot_token_file`; the ConfigMap
+only contains the chat ID, message template and inhibition rules. If the Secret still holds the
+placeholder value, Alertmanager starts and shows alerts in its UI, but Telegram delivery fails. See
+[Alertmanager access](#84-grafana-and-alertmanager-access) to set or rotate the token.
+
+The Compose stack ships an Alertmanager too, but its config still contains a hardcoded bot token —
+see [Security notes](#14-security-notes).
 
 ### 8.8 Retention and footprint
 
 - Prometheus retention: `24h`.
+- Alertmanager: 1 Gi PVC for silences and the notification log.
 - Loki retention: `168h` with filesystem storage and compactor.
 - Tempo: local filesystem blocks/WAL; retention is not explicitly configured, so growth is bounded
   by the 2 Gi PVC.
 - Grafana: 1 Gi PVC for its SQLite database and plugins.
-- cAdvisor and Alloy have no PVC; Alloy uses a 512 Mi `emptyDir` for its storage path.
-- Total observability requests are roughly `450m` CPU / `960Mi`; limits roughly `2.7` cores /
-  `2.1Gi`. Grafana is the hungriest at boot.
+- cAdvisor, node-exporter and Alloy have no PVC; Alloy uses a 512 Mi `emptyDir` for its storage path.
+- Total observability requests are roughly `490m` CPU / `1024Mi`; limits roughly `2.9` cores /
+  `2.3Gi`. Grafana is the hungriest at boot; Alertmanager is intentionally small.
 
 ### 8.9 Changing observability configuration
 
-ConfigMaps are generated from `deploy/k8s/observability/config/` with fixed names. A config-only
-change does not automatically roll the pod, so restart explicitly:
+ConfigMaps are generated from `deploy/k8s/observability/config/`. Kustomize adds a content-hash
+suffix to the generated name and rewrites the workload's `configMap` reference, so a config-only
+change rolls the affected pod automatically:
 
 ```bash
-$EDITOR deploy/k8s/observability/config/prometheus.yml   # or loki.yml, tempo.yml, alloy.alloy, ...
+$EDITOR deploy/k8s/observability/config/prometheus.yml   # or alertmanager.yml, loki.yml, tempo.yml, alloy.alloy, ...
 kubectl apply -k deploy/k8s/observability
-kubectl -n observability rollout restart deployment/prometheus
-# loki / tempo / otel-collector / grafana the same way
+kubectl -n observability rollout status deployment/prometheus
+# alertmanager / loki / tempo / otel-collector / grafana / alloy the same way
 ```
 
-Dashboards live in `config/dashboards/`. Grafana polls the file provider, so they usually appear
-within about 30 seconds after `kubectl apply -k` without a restart. Datasource changes require a
-Grafana restart.
+If you edit a ConfigMap in place (bypassing Kustomize), restart the workload manually with
+`kubectl -n observability rollout restart ...`. Dashboards live in `config/dashboards/`; Grafana
+also polls the file provider, so they appear within about 30 seconds after `kubectl apply -k`.
 
 ### 8.10 Application instrumentation details
 
@@ -1142,7 +1206,7 @@ kubectl -n portfolio exec statefulset/postgres -- \
 | --- | --- | --- |
 | App image | `deploy/k8s/kustomization.yaml` | Pipeline bump or manual `kustomize edit set image` |
 | PostgreSQL | `deploy/k8s/postgres/statefulset.yaml` | Change image, review major-version upgrade path |
-| Prometheus/Loki/Tempo/OTel/Grafana/Alloy/cAdvisor | `deploy/k8s/observability/*.yaml` | Change image, apply, restart, verify |
+| Prometheus/Alertmanager/Loki/Tempo/OTel/Grafana/Alloy/cAdvisor/node-exporter | `deploy/k8s/observability/*.yaml` | Change image, apply, restart, verify |
 | Argo CD | `deploy/argocd/install.yaml` | Replace manifest, server-side apply |
 | CI tools | `deploy/ci/Dockerfile` | Rebuild/publish agent image |
 
@@ -1287,6 +1351,46 @@ minikube ssh -- ls -l /run/containerd/containerd.sock
 cAdvisor runs privileged and mounts host `/`, `/sys`, `/run`, `/var/lib/containerd` and `/dev/disk`.
 If your minikube node uses the Docker runtime, remove `--containerd=/run/containerd/containerd.sock`
 and mount `/var/lib/docker` instead.
+
+**node-exporter target is DOWN / host dashboard has no data**
+
+```bash
+kubectl -n observability get ds,pod -l app.kubernetes.io/name=node-exporter -o wide
+kubectl -n observability logs ds/node-exporter --tail=50
+kubectl -n observability port-forward svc/node-exporter 9100:9100 >/dev/null &
+curl -s http://127.0.0.1:9100/metrics | head
+```
+
+The DaemonSet uses `hostNetwork: true` and mounts host `/proc`, `/sys` and `/` read-only. Confirm the
+pod is Ready, then check that the `node-exporter` target in Prometheus is `UP`. The Grafana host
+dashboard queries `job="node-exporter"`, so a renamed job or Service breaks it.
+
+**Alertmanager pod is Pending or CrashLoopBackOff**
+
+```bash
+kubectl -n observability get deploy,pod,pvc -l app.kubernetes.io/name=alertmanager
+kubectl -n observability describe pod -l app.kubernetes.io/name=alertmanager
+kubectl -n observability logs deploy/alertmanager --tail=80
+kubectl -n observability get secret alertmanager-telegram
+```
+
+- A missing `alertmanager-telegram` Secret keeps the pod from starting. Create it with the deploy
+  script or the `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` command in
+  [Alertmanager access](#84-grafana-and-alertmanager-access).
+- If the pod logs `error parsing config file`, validate the ConfigMap with
+  `amtool check-config` after mounting a token file (see the observability runbook).
+- A `Pending` pod usually means the 1 Gi PVC is unbound. Check the storage provisioner.
+
+**Alertmanager has no Telegram notifications**
+
+```bash
+kubectl -n observability logs deploy/alertmanager | grep -i telegram | tail
+kubectl -n observability get secret alertmanager-telegram \
+  -o jsonpath='{.data.telegram_bot_token}' | base64 -d | wc -c
+```
+
+If the token is `REPLACE_WITH_TELEGRAM_BOT_TOKEN`, update the Secret and restart the Deployment.
+Also confirm the `chat_id` in `config/alertmanager.yml` matches a chat the bot can post to.
 
 ### 12.5 Logs
 
@@ -1434,7 +1538,8 @@ without a documented exception.
 ```
 
 The script asks for confirmation (`yes`). Deleting the `portfolio` namespace deletes the PostgreSQL
-volume and uploaded files. Deleting `observability` deletes Prometheus/Loki/Tempo/Grafana data.
+volume and uploaded files. Deleting `observability` deletes
+Prometheus/Alertmanager/Loki/Tempo/Grafana data.
 
 `monitoring` also removes the cluster-scoped `portfolio-alloy-logs` ClusterRole and
 ClusterRoleBinding, which a plain namespace delete would leave behind.
@@ -1442,7 +1547,7 @@ ClusterRoleBinding, which a plain namespace delete would leave behind.
 Remove host entries if desired:
 
 ```bash
-sudo sed -i '/\(portfolio\|grafana\|argocd\)\.local/d' /etc/hosts
+sudo sed -i '/\(portfolio\|grafana\|alertmanager\|argocd\)\.local/d' /etc/hosts
 ```
 
 To remove everything including the cluster:
@@ -1460,14 +1565,18 @@ ready.
 
 ### 14.1 Known residual risks
 
-- **No TLS:** `portfolio.local`, `grafana.local` and `argocd.local` are plain HTTP. `COOKIE_SECURE`
-  is `false`. Do not expose them beyond localhost/VPN.
+- **No TLS:** `portfolio.local`, `grafana.local`, `alertmanager.local` and `argocd.local` are plain
+  HTTP. `COOKIE_SECURE` is `false`. Do not expose them beyond localhost/VPN.
+- **Alertmanager has no authentication:** anyone who can reach `alertmanager.local` can view alerts
+  and create silences. Keep it on localhost/VPN or put an authenticating proxy in front of it.
 - **Jenkins Docker socket:** `/var/run/docker.sock` is effectively root on the host. Restrict who
   can administer Jenkins, do not run untrusted Jenkinsfiles, and prefer isolated agents for
   higher-assurance use.
-- **Hardcoded Telegram token:** `deploy/alertmanager/alertmanager.yml` contains a bot token for the
-  Compose Alertmanager. It should be revoked and moved to a secret (for example, a Docker secret or
-  environment variable) before further use.
+- **Hardcoded Telegram token in Compose:** `deploy/alertmanager/alertmanager.yml` still contains a
+  bot token for the Compose Alertmanager. Revoke it and move it to a secret (for example, the
+  `secrets/telegram_bot_token` file that Compose already mounts, or an environment variable). The
+  Kubernetes Alertmanager does **not** use that file; it reads the token from the
+  `alertmanager-telegram` Secret.
 - **Historical Docker Hub token:** a token was removed from a deleted `.gitlab-ci.yml` but remains
   in Git history. Revoke it on Docker Hub.
 - **Single points of failure:** one PostgreSQL instance, one Nginx/ingress, one Jenkins, one
@@ -1491,11 +1600,12 @@ ready.
 4. Ensure the proxy overwrites `X-Real-IP`, `X-Forwarded-For` and `X-Forwarded-Proto`; trust only
    known proxies.
 5. Enable HSTS only after HTTPS is verified for all relevant hostnames.
-6. Move secrets to a proper secret manager; never commit `.env`, tokens or kubeconfigs.
+6. Move secrets to a proper secret manager; never commit `.env`, `secrets/`, tokens or kubeconfigs.
 7. Rotate the exposed Telegram token and the historical Docker Hub token.
-8. Add network policies if you add more tenants/workloads.
-9. Back up PostgreSQL and uploads, and test restore.
-10. Keep the Argo CD admin password (or use a scoped API token) and Jenkins credentials in a safe
+8. Put authentication in front of Alertmanager or keep it on a private network.
+9. Add network policies if you add more tenants/workloads.
+10. Back up PostgreSQL and uploads, and test restore.
+11. Keep the Argo CD admin password (or use a scoped API token) and Jenkins credentials in a safe
     store.
 
 ---
@@ -1555,8 +1665,9 @@ Access:
 - `app1` runs `start` (migrations then serve); `app2` and `app3` run `serve`, so migrations run once.
 - The app containers are read-only with a `tmpfs` `/tmp`, drop all capabilities, and use
   `no-new-privileges`.
-- Compose observability includes node-exporter and Alertmanager; Kubernetes does not.
-- Do not commit `.env`, `secrets/` or tokens.
+- Both stacks include Alertmanager and node-exporter. Compose still hardcodes the Telegram token;
+  Kubernetes reads it from the `alertmanager-telegram` Secret.
+- Do not commit `.env`, `secrets/` or tokens. `secrets/` is now in `.gitignore`.
 
 ### 15.5 Compose ports reference
 
@@ -1587,10 +1698,10 @@ Access:
 | Database | StatefulSet + 2 Gi PVC | `postgres_data` volume |
 | Uploads | 1 Gi PVC | `uploads_data` volume |
 | Ingress | minikube ingress-nginx, `*.local` | Nginx on `127.0.0.1:8080` |
-| Metrics | Prometheus + cAdvisor | Prometheus + cAdvisor + node-exporter |
+| Metrics | Prometheus + cAdvisor + node-exporter | Prometheus + cAdvisor + node-exporter |
 | Logs | Loki + Alloy (Kubernetes API) | Loki + Alloy (Docker log files) |
 | Traces | OTel Collector → Tempo | OTel Collector → Tempo |
-| Alerting | Prometheus rules only (no Alertmanager) | Alertmanager + Telegram receiver |
+| Alerting | Prometheus rules + Alertmanager (Telegram token from a Secret) | Alertmanager + Telegram receiver (token currently hardcoded) |
 | Jenkins | Controller/agent via Compose, deploys through GitOps | Optional controller/agent |
 | GitLab CE | Not deployed | Included (runner commented out) |
 | TLS | None | None |
@@ -1614,8 +1725,8 @@ Access:
 
 - Kustomize rendering, YAML/JSON parsing and shell script syntax.
 - App + PostgreSQL manifests, migrations, health/readiness probes and the admin bootstrap flow.
-- Observability manifests, Prometheus scrape config, Grafana provisioning, Loki/Alloy and
-  Tempo/OTel wiring.
+- Observability manifests, Prometheus scrape config and rules (`promtool`), Alertmanager routing
+  (`amtool check-config`), Grafana provisioning, Loki/Alloy and Tempo/OTel wiring.
 - Unit tests, PostgreSQL integration tests and the Jenkinsfile stage structure.
 - README structure: balanced code fences, valid relative links and internal anchors.
 

@@ -8,14 +8,20 @@ NAMESPACE="${NAMESPACE:-portfolio}"
 ADMIN_SECRET="portfolio-admin"
 JOB="create-admin"
 
-command -v kubectl >/dev/null || { echo "ERROR: 'kubectl' is required" >&2; exit 1; }
+command -v kubectl >/dev/null || {
+  echo "ERROR: 'kubectl' is required" >&2
+  exit 1
+}
 
 # Keep the one-shot Job on the same image Argo CD deploys. The Job is not part
 # of the kustomization (it must not be auto-applied), so resolve the tag here.
 if [[ -z "${IMAGE:-}" ]]; then
   IMAGE="$(kubectl kustomize deploy/k8s | awk '/image: nam2107\/portfolio:/{print $2; exit}')"
 fi
-[[ -n "$IMAGE" ]] || { echo "ERROR: could not resolve the portfolio image tag" >&2; exit 1; }
+[[ -n "$IMAGE" ]] || {
+  echo "ERROR: could not resolve the portfolio image tag" >&2
+  exit 1
+}
 
 read -r -p 'Admin username (3-80 characters): ' ADMIN_USERNAME
 read -r -s -p 'Admin password (at least 12 characters): ' ADMIN_PASSWORD
@@ -23,9 +29,18 @@ echo
 read -r -s -p 'Repeat password: ' ADMIN_PASSWORD_CONFIRM
 echo
 
-[[ "$ADMIN_PASSWORD" == "$ADMIN_PASSWORD_CONFIRM" ]] || { echo 'ERROR: passwords did not match' >&2; exit 1; }
-[[ ${#ADMIN_PASSWORD} -ge 12 ]] || { echo 'ERROR: password must be at least 12 characters' >&2; exit 1; }
-[[ ${#ADMIN_USERNAME} -ge 3 && ${#ADMIN_USERNAME} -le 80 ]] || { echo 'ERROR: username must be 3-80 characters' >&2; exit 1; }
+[[ "$ADMIN_PASSWORD" == "$ADMIN_PASSWORD_CONFIRM" ]] || {
+  echo 'ERROR: passwords did not match' >&2
+  exit 1
+}
+[[ ${#ADMIN_PASSWORD} -ge 12 ]] || {
+  echo 'ERROR: password must be at least 12 characters' >&2
+  exit 1
+}
+[[ ${#ADMIN_USERNAME} -ge 3 && ${#ADMIN_USERNAME} -le 80 ]] || {
+  echo 'ERROR: username must be 3-80 characters' >&2
+  exit 1
+}
 
 cleanup() {
   kubectl -n "$NAMESPACE" delete secret "$ADMIN_SECRET" --ignore-not-found >/dev/null 2>&1 || true

@@ -14,13 +14,55 @@ groups:
     rules:
       - alert: PortfolioAppDown
         expr: up{job="portfolio-app"} == 0
-        for: 1m
+        for: 10s
         labels:
           severity: critical
           service: portfolio-web
         annotations:
           summary: Portfolio web service is DOWN
           description: Prometheus has been unable to scrape the portfolio app for more than 1 minute.
+
+  - name: host-resource-alerts
+    rules:
+      - alert: HostHighCPU
+        expr: |
+          (
+            1 - avg by (instance) (rate(node_cpu_seconds_total{job="node-exporter",mode="idle"}[5m]))
+          ) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Host CPU usage is high
+          description: Host {{ $labels.instance }} CPU usage has been above 85% for 10 minutes.
+
+      - alert: HostHighMemory
+        expr: |
+          (
+            1 - node_memory_MemAvailable_bytes{job="node-exporter"}
+            /
+            node_memory_MemTotal_bytes{job="node-exporter"}
+          ) * 100 > 90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Host memory usage is high
+          description: Host {{ $labels.instance }} memory usage has been above 90% for 10 minutes.
+
+      - alert: HostFilesystemAlmostFull
+        expr: |
+          (
+            1 - node_filesystem_avail_bytes{job="node-exporter",fstype!~"tmpfs|overlay|squashfs|ramfs"}
+            /
+            node_filesystem_size_bytes{job="node-exporter",fstype!~"tmpfs|overlay|squashfs|ramfs"}
+          ) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Host filesystem is almost full
+          description: Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} has been more than 85% full for 10 minutes.
 
   - name: container-resource-alerts
     rules:
